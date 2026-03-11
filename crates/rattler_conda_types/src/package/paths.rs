@@ -3,6 +3,8 @@ use crate::{
     package::has_prefix::HasPrefixEntry,
     package::{Files, HasPrefix, NoLink, NoSoftlink},
 };
+use memchr::memmem;
+use memmap2::Mmap;
 use rattler_digest::serde::SerializableHash;
 use rattler_macros::sorted;
 use serde::{Deserialize, Serialize, Serializer};
@@ -215,6 +217,49 @@ pub struct PrefixPlaceholder {
     /// files without a shebang, or older packages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shebang_length: Option<usize>,
+}
+
+impl PrefixPlaceholder {
+    /// A new PrefixPlaceholder 
+    pub fn new(file_mode: FileMode, placeholder: String) -> Self{
+        PrefixPlaceholder { 
+            file_mode, 
+            placeholder,
+            offsets: Some(vec![]),
+        }
+    }
+
+    pub fn get_or_collect_offsets(&self, file: &Mmap) -> Vec<usize> {
+        match self.offsets {
+            Some(offset) => {offset},
+            None => {
+                self.fill_offsets(file);
+                self.offsets.unwrap()
+            },
+        }
+    }
+    // using this function should result in some type of call back up to notify the paths.json should vbe updated & saved
+    /// The function to 
+    pub fn fill_offsets(&mut self, open_file: &Mmap) {
+        // read through the open file and fill in the offsets to the offsets vector
+        let mut found_offsets: Vec<usize> =  memmem::find_iter(open_file, &self.placeholder).collect();
+
+        // if found_offsets.is_empty() || Some(found_offsets) == self.offsets {
+        //     // There were no (new) offsets in the open file
+        //     return false; 
+        // }
+
+        match &mut self.offsets {
+            Some(offset) => {
+                offset.append(&mut found_offsets)
+            },
+            None => {
+                // there is no list in the offsets yet so it might have been v1/ empty v2 //
+                self.offsets = Some(found_offsets)
+            }
+        };
+    }
+
 }
 
 /// A single entry in the `paths.json` file.
