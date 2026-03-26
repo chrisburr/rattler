@@ -114,3 +114,17 @@ e2e-s3-aws = "nu scripts/e2e/s3-aws.nu"
 [environments.s3]
 features = ["s3"]
 no-default-feature = true
+
+#------------------------------
+# rattler-fs E2E mount test
+#------------------------------
+[feature.rattler-fs.dependencies]
+rattler = { path = "crates/rattler-bin" }
+nushell = ">=0.106.1,<0.107"
+
+[feature.rattler-fs.tasks]
+e2e-rattler-fs = "nu scripts/e2e/rattler-fs-mount.nu"
+
+[environments.rattler-fs]
+features = ["rattler-fs"]
+no-default-feature = true

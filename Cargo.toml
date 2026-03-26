@@ -80,7 +80,7 @@ fs-err = { version = "3.1.0" }
 fslock = "0.2.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
-fuser = { version = "0.17.0", features = ["libfuse"] }
+fuser = { version = "0.17.0", default-features = false }
 # lots of other crates are still stuck on older version which breaks `deserialize`
 # pinning to 0.14.7 because 0.14.8 introduces deprecation notices.
 generic-array = "=0.14.7"
@@ -232,3 +232,4 @@ rattler_virtual_packages = { path = "crates/rattler_virtual_packages", version =
 
 # This is also a rattler crate, but we only pin it to minor version
 simple_spawn_blocking = { path = "crates/simple_spawn_blocking", version = "1.1", default-features = false }
+

@@ -1,603 +1,507 @@
-use std::{os::unix::ffi::OsStrExt, path::PathBuf};
+//! Ranged prefix replacement for FUSE/NFS reads.
+//!
+//! Serves a byte range `[start, end)` from a source file with prefix
+//! placeholder replacements applied on the fly, without materializing the
+//! entire transformed file in memory.
+
 use memchr::memmem;
-use memmap2::Mmap;
-use rattler_conda_types::package::PrefixPlaceholder;
 
-
-/// Replace the prefix with a mount_point without having to actually write the prefix's
-// TODO: This rendition of this replacement is not as performant as it could be, rethinking this strategy would be nice
-pub fn text_prefix_replacement(
-    placeholder: &PrefixPlaceholder, 
-    start: usize, 
-    end: usize, 
-    _size: usize, 
-    file: &Mmap, 
-    mount_point: &PathBuf,
-) -> Vec<u8> {
-    // check if the prefix placeholder is there 
-
-    let new_prefix = mount_point.as_os_str().as_bytes();
-    let length_placeholder = placeholder.placeholder.len();
-    let length_prefix = new_prefix.len();
-    let length_change = length_placeholder - length_prefix;
-    
-    let offsets = placeholder.get_or_collect_offsets(file);
-    let total_replacements = offsets.len();
-    let transformed_size = file.len() - (total_replacements * length_change);
-
-    let actual_end = end.min(transformed_size);
-    let actual_start = start.min(transformed_size);
-    
-    // early return when the length of the asked section doesnt exist
-    if actual_start >= actual_end {
-        return vec![]
-    }
-
-    let length = actual_end - actual_start;
-    let mut buffer = vec![0u8; length];
-    let mut buffer_pos = 0;
-    
-    let mut file_pos = 0;
-    let mut transformed_pos = 0;
-    let mut placeholder_index = 0;
-
-    while file_pos < file.len() && buffer_pos < length {
-        if placeholder_index < total_replacements
-            && file_pos == placeholder.offsets.unwrap()[placeholder_index] {
-            for i in 0..length_prefix {
-                if transformed_pos >= actual_start && transformed_pos < actual_end {
-                    buffer[buffer_pos] = new_prefix[i];
-                    buffer_pos += 1;
-                }
-                transformed_pos += 1;
-                if buffer_pos >= length {
-                    return buffer
-                }
-            }
-            file_pos += length_placeholder;
-            placeholder_index += 1;
-        } else {
-            if transformed_pos >= actual_start && transformed_pos < actual_end {
-                buffer[buffer_pos] = file[file_pos];
-                buffer_pos += 1;
-            }
-            transformed_pos += 1;
-            file_pos += 1;
-        }
-    }
-    buffer
-}
-
-/// Replace the prefix for the new prefix in binary files
-// This function could also use some performance improvement (not checking every character individually mainly)
-pub fn binary_prefix_replacement(
-    placeholder: &PrefixPlaceholder,
+/// Read a range from a text file with prefix replacements applied.
+///
+/// Text-mode replacement changes `old_prefix` → `new_prefix` at each offset.
+/// Because the replacement can change length, output byte positions shift
+/// relative to source positions. The `offsets` array gives the source-file
+/// positions of each placeholder occurrence.
+///
+/// Returns the bytes in the output range `[start, end)`.
+pub fn text_ranged_read(
+    source: &[u8],
+    old_prefix: &[u8],
+    new_prefix: &[u8],
+    offsets: &[usize],
     start: usize,
     end: usize,
-    _size: usize,
-    file: &Mmap,
-    mount_point: &PathBuf
 ) -> Vec<u8> {
+    let delta = new_prefix.len() as isize - old_prefix.len() as isize;
+    let transformed_len = (source.len() as isize + delta * offsets.len() as isize).max(0) as usize;
 
-    let new_prefix = mount_point.as_os_str().as_bytes();
-    let length_placeholder = placeholder.placeholder.len();
-    let length_prefix = new_prefix.len();
-    
-    // Handle underflow: use checked subtraction or i64
-    if length_prefix > length_placeholder {
-        panic!("New prefix is longer than placeholder");
+    let actual_end = end.min(transformed_len);
+    let actual_start = start.min(transformed_len);
+    if actual_start >= actual_end {
+        return vec![];
     }
-    let length_change = length_placeholder - length_prefix;
-    
-    // Fix: proper bounds check
-    if start >= end || start >= file.len() {
-        return vec![]
-    }
-    
-    let length = end - start;
-    let mut buffer = vec![0u8; length];
-    let mut buffer_pos = 0;
 
-    let offsets = placeholder.get_or_collect_offsets(file);
+    let capacity = actual_end - actual_start;
+    let mut buffer = Vec::with_capacity(capacity);
 
-    let mut next_placeholder_index = match offsets.binary_search(&start){
-        Ok(index) => index,
-        Err(index) => index
-    };
+    // Walk through the source, tracking the current position in both
+    // source space and output (transformed) space.
+    let mut src_pos = 0usize;
+    let mut out_pos = 0usize;
+    let mut offset_idx = 0usize;
 
-    // should be actual start
-    let mut unfinished_replacements = if next_placeholder_index >= 1 {
-        let placeholders_before = &offsets[0..next_placeholder_index];
-        find_unfinished_replacements(file[0..start].to_vec(), placeholders_before.to_vec())
-    } else {
-        0
-    };
-
-    let actual_start = if unfinished_replacements >= 1 {
-        start + ( unfinished_replacements * length_change ) 
-    } else {
-        start
-    };
-
-    let mut file_pos = actual_start;
-
-    let total_replacements = offsets.len();
-
-    while file_pos < end && buffer_pos < length {
-        let next_placeholder = if next_placeholder_index < total_replacements {
-            placeholder.offsets[next_placeholder_index]
-        } else {
-            end
-        };
-
-        // Only process if we've reached a placeholder within our range
-        if file_pos == next_placeholder && next_placeholder < end {
-            next_placeholder_index += 1;
-            
-            // Copy the new prefix
-            let copy_len = length_prefix.min(length - buffer_pos);
-            buffer[buffer_pos..buffer_pos + copy_len].copy_from_slice(&new_prefix[..copy_len]);
-            buffer_pos += copy_len;
-            unfinished_replacements += 1;
-            
-            if buffer_pos >= length {
-                return buffer;
-            }
-
-            // Skip the old placeholder in the file
-            file_pos += length_placeholder;
-            
-            if file_pos >= file.len() || file_pos >= end {
-                break;
-            }
-
-            // Get next placeholder position for boundary checking
-            let following_placeholder = if next_placeholder_index < total_replacements {
-                placeholder.offsets[next_placeholder_index]
-            } else {
-                end
-            };
-
-            // Copy until null byte, next placeholder, or end
-            while file_pos < file.len() 
-                && file_pos < end 
-                && file_pos < following_placeholder
-                && file[file_pos] != b'\x00' 
-                && buffer_pos < length 
-            {
-                buffer[buffer_pos] = file[file_pos];
-                buffer_pos += 1;
-                file_pos += 1;
-            }
-
-            // If we hit a null byte, copy it & add the padding after the string content
-            if file_pos < file.len()
-                && file_pos < end
-                && file[file_pos] == b'\x00'
-                {
-                    // buffer[buffer_pos] = b'\x00';
-                    // file_pos += 1;
-                    // buffer_pos = file_pos - actual_start;
-                    // check if there are unfinished replacements and add the correct amount of null bytes to the buffer
-                    
-                    buffer_pos += unfinished_replacements * length_change;
-                    unfinished_replacements = 0;
-                    
+    while src_pos < source.len() && buffer.len() < capacity {
+        if offset_idx < offsets.len() && src_pos == offsets[offset_idx] {
+            // At a replacement site: emit new_prefix bytes
+            for &b in new_prefix {
+                if out_pos >= actual_start && out_pos < actual_end {
+                    buffer.push(b);
                 }
-        } else if file[file_pos] == b'\x00' && next_placeholder < end && unfinished_replacements > 0{
-            println!("{unfinished_replacements:?}");
-            // buffer_pos += 1; // the already existing null byte
-            buffer_pos += unfinished_replacements * length_change;
-            unfinished_replacements = 0;
-        }else {
-            // Regular copy
-            buffer[buffer_pos] = file[file_pos];
-            buffer_pos += 1;
-            file_pos += 1;
+                out_pos += 1;
+                if buffer.len() >= capacity {
+                    return buffer;
+                }
+            }
+            // Skip the old prefix in the source
+            src_pos += old_prefix.len();
+            offset_idx += 1;
+        } else {
+            // Regular byte: copy through
+            if out_pos >= actual_start && out_pos < actual_end {
+                buffer.push(source[src_pos]);
+            }
+            out_pos += 1;
+            src_pos += 1;
         }
-    }    
+    }
+
     buffer
 }
 
+/// Read a range from a binary file with prefix replacements applied.
+///
+/// Binary-mode replacement swaps `old_prefix` → `new_prefix` and pads with
+/// null bytes to maintain the same total length. Multiple consecutive
+/// replacements that share a c-string (no null terminator between them)
+/// accumulate padding which is emitted at the next null byte.
+///
+/// Output length always equals source length.
+///
+/// Returns the bytes in the output range `[start, end)`.
+pub fn binary_ranged_read(
+    source: &[u8],
+    old_prefix: &[u8],
+    new_prefix: &[u8],
+    offsets: &[usize],
+    start: usize,
+    end: usize,
+) -> Vec<u8> {
+    assert!(
+        new_prefix.len() <= old_prefix.len(),
+        "new prefix cannot be longer than old prefix in binary mode"
+    );
 
-fn find_unfinished_replacements(file_before: Vec<u8>, offsets: Vec<usize>) -> usize {
-    // there is at least one offset before 
-    let last_nul_byte = match memmem::rfind(&file_before, b"\x00") {
-        Some(last_nul_byte) =>  {last_nul_byte},
-        None => 0
-    };
-    if offsets.last().unwrap() < &last_nul_byte {
-        // the last 0 byte is after the last prefix meaning there is no unfinished replacement
-        return 0
-    } 
-    let mut unfinished_replacements = 0;
-    let reversed_offsets: Vec<usize> = offsets.into_iter().rev().collect();
-    for offset in reversed_offsets {
-        if offset >= last_nul_byte {
-            unfinished_replacements += 1;
+    let actual_end = end.min(source.len());
+    let actual_start = start.min(source.len());
+    if actual_start >= actual_end {
+        return vec![];
+    }
+
+    let length_change = old_prefix.len() - new_prefix.len();
+    let capacity = actual_end - actual_start;
+    let mut buffer = Vec::with_capacity(capacity);
+
+    // Find the first offset at or after `start` via binary search.
+    let first_offset_idx = offsets.partition_point(|&o| o < actual_start);
+
+    // Count "unfinished replacements" — replacements before `start` whose
+    // null-padding hasn't been emitted yet (no null byte between the
+    // replacement and `start`).
+    let unfinished = count_unfinished_before(source, offsets, first_offset_idx, actual_start);
+
+    // Compute where in the source to start reading, accounting for
+    // accumulated padding from unfinished replacements that shifts our
+    // position forward.
+    let src_start = actual_start + unfinished * length_change;
+
+    let mut src_pos = src_start;
+    let mut offset_idx = first_offset_idx;
+    let mut pending_padding = unfinished * length_change;
+
+    while src_pos < source.len() && buffer.len() < capacity {
+        if offset_idx < offsets.len() && src_pos == offsets[offset_idx] {
+            // At a replacement site
+            offset_idx += 1;
+
+            // Emit the new prefix
+            for &b in new_prefix {
+                if buffer.len() >= capacity {
+                    return buffer;
+                }
+                buffer.push(b);
+            }
+
+            // Skip the old prefix in source
+            src_pos += old_prefix.len();
+            pending_padding += length_change;
+
+            // Determine the boundary for this c-string: next offset or end
+            let boundary = offsets.get(offset_idx).copied().unwrap_or(source.len());
+
+            // Copy bytes after the old prefix until null byte or next offset
+            while src_pos < source.len()
+                && src_pos < boundary
+                && source[src_pos] != 0
+                && buffer.len() < capacity
+            {
+                buffer.push(source[src_pos]);
+                src_pos += 1;
+            }
+
+            // If we hit a null byte, emit the accumulated padding
+            if src_pos < source.len() && source[src_pos] == 0 {
+                // Emit the original null byte position's worth of padding
+                for _ in 0..pending_padding {
+                    if buffer.len() >= capacity {
+                        return buffer;
+                    }
+                    buffer.push(0);
+                }
+                pending_padding = 0;
+            }
+        } else if source[src_pos] == 0 && pending_padding > 0 {
+            // Null byte with accumulated padding from previous replacements
+            buffer.push(0);
+            src_pos += 1;
+            for _ in 0..pending_padding {
+                if buffer.len() >= capacity {
+                    return buffer;
+                }
+                buffer.push(0);
+            }
+            pending_padding = 0;
         } else {
-            return unfinished_replacements
+            // Regular byte
+            buffer.push(source[src_pos]);
+            src_pos += 1;
         }
-    };
-    unfinished_replacements
+    }
+
+    // Emit any remaining padding at EOF (e.g. file ends without a null byte
+    // after replacements)
+    while pending_padding > 0 && buffer.len() < capacity {
+        buffer.push(0);
+        pending_padding -= 1;
+    }
+
+    buffer
+}
+
+/// Count replacements before `first_offset_idx` that haven't had their
+/// null-padding emitted yet (i.e. no null byte between the last replacement
+/// before `start` and `start` itself).
+fn count_unfinished_before(
+    source: &[u8],
+    offsets: &[usize],
+    first_offset_idx: usize,
+    start: usize,
+) -> usize {
+    if first_offset_idx == 0 {
+        return 0;
+    }
+
+    // Find the last null byte before `start` in the source
+    let region = &source[..start.min(source.len())];
+    let last_null = memchr::memrchr(0, region);
+
+    // Count offsets that are after the last null byte (or from the start if no null)
+    let threshold = last_null.map_or(0, |pos| pos + 1);
+    offsets[..first_offset_idx]
+        .iter()
+        .rev()
+        .take_while(|&&o| o >= threshold)
+        .count()
+}
+
+/// Compute replacement offsets by scanning the source for the placeholder.
+/// Used when paths.json doesn't provide offsets (legacy v1 format).
+pub fn collect_offsets(source: &[u8], placeholder: &[u8]) -> Vec<usize> {
+    memmem::find_iter(source, placeholder).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf};
-    use memmap2::MmapOptions;
-    use rattler_conda_types::package::FileMode;
-    use paths::PrefixPlaceholder;
-    use crate::prefix_replacement::{binary_prefix_replacement, find_unfinished_replacements, text_prefix_replacement};
+    use super::*;
 
-    #[test]
-    fn test_find_one_unfinished_replacements(){
-        let file_before = b"01ABCD2\x0034ABCD5";
-        let offsets = vec![2, 10];
+    // ── Text mode tests ──────────────────────────────────────────────
 
-        let expected_unfinished_replacements = 1;
-        let created_unfinished_replacements = find_unfinished_replacements(file_before.to_vec(), offsets.clone());
-        assert_eq!(expected_unfinished_replacements, created_unfinished_replacements, "unfinished replacements failed for {:?}, expected unfinished replacements {expected_unfinished_replacements:?}, actual unfinished_replacements {created_unfinished_replacements:?}", &offsets);
-    }
-
-    #[test]
-    fn test_find_two_unfinished_replacements_no_null_byte(){
-        let file_before = b"01ABCD234ABCD5";
-        let offsets = vec![2, 9];
-
-        let expected_unfinished_replacements = 2;
-        let created_unfinished_replacements = find_unfinished_replacements(file_before.to_vec(), offsets.clone());
-        assert_eq!(expected_unfinished_replacements, created_unfinished_replacements, "unfinished replacements failed for {:?}, expected unfinished replacements {expected_unfinished_replacements:?}, actual unfinished_replacements {created_unfinished_replacements:?}", &offsets);
-    }
-    
-    fn do_text_test(placeholder: &str, prefix: &str, before: &[u8], expected: &[u8], start: usize, end: usize) {
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Text,
-            placeholder.as_bytes().to_vec(),
+    fn text_test(
+        placeholder: &[u8],
+        prefix: &[u8],
+        source: &[u8],
+        expected: &[u8],
+        start: usize,
+        end: usize,
+    ) {
+        let offsets = collect_offsets(source, placeholder);
+        let result = text_ranged_read(source, placeholder, prefix, &offsets, start, end);
+        assert_eq!(
+            result, expected,
+            "text replacement [{start}..{end}] of {source:?}: expected {expected:?}, got {result:?}"
         );
-        let size = before.len();
-
-        let mut file = MmapOptions::new().len(before.len()).map_anon().unwrap();
-        file[0..before.len()].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
-
-        let created_buffer = text_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "replacement failed for {before:?} to expected: {expected:?}, {start} to {end}");
     }
 
-
-    fn do_binary_test(placeholder: &str, prefix: &str, before: &[u8], expected: &[u8], start: usize, end: usize) {
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Binary,
-            placeholder.as_bytes().to_vec(),
+    fn binary_test(
+        placeholder: &[u8],
+        prefix: &[u8],
+        source: &[u8],
+        expected: &[u8],
+        start: usize,
+        end: usize,
+    ) {
+        let offsets = collect_offsets(source, placeholder);
+        let result = binary_ranged_read(source, placeholder, prefix, &offsets, start, end);
+        assert_eq!(
+            result, expected,
+            "binary replacement [{start}..{end}] of {source:?}: expected {expected:?}, got {result:?}"
         );
-        let size = before.len();
+    }
 
-        let mut file = MmapOptions::new().len(before.len()).map_anon().unwrap();
-        file[0..before.len()].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
+    // Full-file text replacements
 
-        let created_buffer = binary_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "replacement failed for {before:?} to expected: {expected:?}, {start} to {end}");
+    #[test]
+    fn text_full_file() {
+        text_test(
+            b"ABCD",
+            b"XY",
+            b"01ABCD23456ABCD7890",
+            b"01XY23456XY7890",
+            0,
+            19,
+        );
     }
 
     #[test]
-    fn test_binary_replacement_full_file_multiple_placeholders() {
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"\x00\x00ABCDZ\x00\x00\x00ABCDEFABCDEF\x00\x00\x00ABCDMNOPQRSABCDMNOPQRSABCDMNOPQRS\x00\x00";
-        let start = 0;
-        let end = before.len(); 
-        
+    fn text_only_placeholder() {
+        text_test(b"ABCD", b"XY", b"ABCD", b"XY", 0, 4);
+    }
+
+    #[test]
+    fn text_consecutive_placeholders() {
+        text_test(b"ABCD", b"XY", b"ABCDABCD", b"XYXY", 0, 8);
+    }
+
+    #[test]
+    fn text_no_placeholders() {
+        text_test(b"ABCD", b"XY", b"0123456789", b"0123456789", 0, 10);
+    }
+
+    #[test]
+    fn text_same_length() {
+        text_test(
+            b"ABCD",
+            b"WXYZ",
+            b"01ABCD6789012ABCD7890",
+            b"01WXYZ6789012WXYZ7890",
+            0,
+            21,
+        );
+    }
+
+    #[test]
+    fn text_empty_file() {
+        text_test(b"ABCD", b"XY", b"", b"", 0, 0);
+    }
+
+    #[test]
+    fn text_many_placeholders() {
+        let mut source = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..10u8 {
+            source.extend_from_slice(&[i + b'0', i + b'0']);
+            source.extend_from_slice(b"ABCD");
+            expected.extend_from_slice(&[i + b'0', i + b'0']);
+            expected.extend_from_slice(b"XY");
+        }
+        text_test(b"ABCD", b"XY", &source, &expected, 0, source.len());
+    }
+
+    // Partial-range text replacements
+
+    #[test]
+    fn text_partial_range() {
+        text_test(
+            b"ABCD",
+            b"XY",
+            b"ABCD0ABCD5ABCD0ABCD5ABCD",
+            b"0XY5XY0",
+            2,
+            9,
+        );
+    }
+
+    #[test]
+    fn text_start_after_prefix() {
+        // Output: "XY01234XY56789" (14 chars) — start at index 5 = "34XY56789"
+        text_test(b"ABCD", b"XY", b"ABCD01234ABCD56789", b"34XY56789", 5, 18);
+    }
+
+    #[test]
+    fn text_start_between_placeholders() {
+        // Output: "XY0123XY5678XY" — start at index 5 = "3XY5678XY"
+        text_test(b"ABCD", b"XY", b"ABCD0123ABCD5678ABCD", b"3XY5678XY", 5, 20);
+    }
+
+    #[test]
+    fn text_start_at_placeholder() {
+        // Output: "01234XY6789XY" — start at index 5 = "XY6789XY"
+        text_test(b"ABCD", b"XY", b"01234ABCD6789ABCD", b"XY6789XY", 5, 17);
+    }
+
+    #[test]
+    fn text_longer_placeholder() {
+        text_test(
+            b"ABCDEFGH",
+            b"XYZ",
+            b"01ABCDEFGH234ABCDEFGH567",
+            b"01XYZ234XYZ567",
+            0,
+            24,
+        );
+    }
+
+    // ── Binary mode tests ────────────────────────────────────────────
+
+    #[test]
+    fn binary_full_file() {
+        binary_test(
+            b"ABCD",
+            b"XY",
+            b"01ABCD23\x00456ABCD78\x0090",
+            b"01XY23\x00\x00\x00456XY78\x00\x00\x0090",
+            0,
+            21,
+        );
+    }
+
+    #[test]
+    fn binary_only_placeholder() {
+        binary_test(b"ABCD", b"XY", b"ABCD", b"XY\x00\x00", 0, 4);
+    }
+
+    #[test]
+    fn binary_no_placeholders() {
+        binary_test(b"ABCD", b"XY", b"0123456789", b"0123456789", 0, 10);
+    }
+
+    #[test]
+    fn binary_same_length() {
+        binary_test(
+            b"ABCD",
+            b"WXYZ",
+            b"01ABCD6789012ABCD7890",
+            b"01WXYZ6789012WXYZ7890",
+            0,
+            21,
+        );
+    }
+
+    #[test]
+    fn binary_consecutive_placeholders() {
+        binary_test(b"ABCD", b"XY", b"ABCDABCD", b"XYXY\x00\x00\x00\x00", 0, 8);
+    }
+
+    #[test]
+    fn binary_multiple_placeholders() {
+        let source = b"\x00\x00ABCDZ\x00\x00\x00ABCDEFABCDEF\x00\x00\x00ABCDMNOPQRSABCDMNOPQRSABCDMNOPQRS\x00\x00";
         let expected = b"\x00\x00XYZ\x00\x00\x00\x00\x00XYEFXYEF\x00\x00\x00\x00\x00\x00\x00XYMNOPQRSXYMNOPQRSXYMNOPQRS\x00\x00\x00\x00\x00\x00\x00\x00";
-        do_binary_test(placeholder, prefix, before, expected, start, end);
+        binary_test(b"ABCD", b"XY", source, expected, 0, source.len());
     }
 
     #[test]
-    fn test_text_prefix_replacement_full_file() {
-        do_text_test("ABCD", "XY", b"01ABCD23456ABCD7890", b"01XY23456XY7890", 0, b"01ABCD23456ABCD7890".len());
+    fn binary_empty_file() {
+        binary_test(b"ABCD", b"XY", b"", b"", 0, 0);
     }
 
     #[test]
-    fn test_binary_prefix_replacement_full_file() {
-        do_binary_test("ABCD", "XY", b"01ABCD23\x00456ABCD78\x0090", b"01XY23\x00\x00\x00456XY78\x00\x00\x0090", 0, b"01ABCD23\x00456ABCD78\x0090".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_partial_range() {
-        // Replace only a portion of the file
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD0ABCD5ABCD0ABCD5ABCD";
-        let start = 2;
-        let end = 9; // Only process middle section
-        
-        let expected = b"0XY5XY0";
-        do_text_test(placeholder, prefix, before, expected, start, end);
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_partial_range() {
-        // Replace only a portion of the file
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD\x000ABCD\x005ABCD\x000ABCD\x005ABCD\x00";
-        let start = 5;
-        let end = 10; // Only process middle section
-        
-        let expected = b"0XY\x00\x00";
-        do_binary_test(placeholder, prefix, before, expected, start, end);
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_start_after_prefix() {
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD01234ABCD56789";
-        let expected = b"34XY56789";
-        
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Text,
-            placeholder.as_bytes().to_vec(),
-        );
-        let start = 5;
-        let end = before.len();
-        let size = before.len(); 
-
-        let mut file = MmapOptions::new().len(end).map_anon().unwrap();
-        file[0..end].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
-
-        let created_buffer = text_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "Start after prefix failed");
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_start_after_prefix() {
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD01234ABCD\x0056789";
-        let expected = b"34XY\x00\x00\x00\x00\x0056789";
-        
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Binary,
-            placeholder.as_bytes().to_vec(),
-        );
-        let start = 5;
-        let end = before.len();
-        let size = before.len(); 
-
-        let mut file = MmapOptions::new().len(end).map_anon().unwrap();
-        file[0..end].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
-
-        let created_buffer = 
-        binary_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "Start after prefix failed");
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_start_between_placeholders() {
-        // Start in the middle, between two placeholders
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD0123ABCD5678ABCD";
-        let expected = b"3XY5678XY"; // Starting at position 7
-        
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Text,
-            placeholder.as_bytes().to_vec(),
-        );
-        let start = 5;
-        let end = before.len();
-        let size = end - start;
-
-        let mut file = MmapOptions::new().len(end).map_anon().unwrap();
-        file[0..end].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
-
-        let created_buffer = text_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "Start between placeholders failed");
-    }
-    #[test]
-    fn test_binary_prefix_replacement_start_between_placeholders() {
-        // Start in the middle, between two placeholders
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"ABCD012\x003ABCD5678ABCD";
-        let expected = b"012\x00\x00\x003XY5678XY\x00\x00\x00\x00"; // Starting at position 7
-        
-        let mut placeholder_obj = PrefixPlaceholder::new(
-            FileMode::Binary,
-            placeholder.as_bytes().to_vec(),
-        );
-        let start = 2;
-        let end = before.len();
-        let size = end - start;
-
-        let mut file = MmapOptions::new().len(end).map_anon().unwrap();
-        file[0..end].copy_from_slice(before);
-        let file = file.make_read_only().unwrap();
-        placeholder_obj.fill_offsets(&file);
-        let mount_point = PathBuf::from(prefix);
-
-        let created_buffer = binary_prefix_replacement(&placeholder_obj, start, end, size, &file, &mount_point);
-        assert_eq!(created_buffer, expected, "Start between placeholders failed");
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_start_at_placeholder() {
-        // Start exactly at a placeholder position
-        do_text_test("ABCD", "XY", b"01234ABCD6789ABCD", b"XY6789XY", 5, b"01234ABCD6789ABCD".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_start_at_placeholder() {
-        // Start exactly at a placeholder position
-        do_binary_test("ABCD", "XY", b"01234ABCD\x006789ABCD\x00", b"XY\x00\x00\x006789XY\x00\x00\x00", 5, b"01234ABCD\x006789ABCD\x00".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_no_placeholders() {
-        do_text_test("ABCD", "XY", b"0123456789", b"0123456789", 0, b"0123456789".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_no_placeholders() {
-        do_binary_test("ABCD", "XY", b"0123456789", b"0123456789", 0, b"0123456789".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_only_placeholder() {
-        do_text_test("ABCD", "XY", b"ABCD", b"XY", 0, b"ABCD".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_only_placeholder() {
-        do_binary_test("ABCD", "XY", b"ABCD", b"XY\x00\x00", 0, b"ABCD".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_start_with_placeholder() {
-        do_text_test("ABCD", "XY", b"ABCD01234", b"XY01234", 0, b"ABCD01234".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_start_with_placeholder() {
-        do_binary_test("ABCD", "XY", b"ABCD\x0001234", b"XY\x00\x00\x0001234", 0, b"ABCD\x0001234".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_end_with_placeholder() {
-        do_text_test("ABCD", "XY", b"01234ABCD", b"01234XY", 0, b"01234ABCD".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_end_with_placeholder() {
-        do_binary_test("ABCD", "XY", b"01234ABCD", b"01234XY\x00\x00", 0, b"01234ABCD".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_consecutive_placeholders() {
-        do_text_test("ABCD", "XY", b"ABCDABCD", b"XYXY", 0, b"ABCDABCD".len());
-    }
-
-     #[test]
-    fn test_binary_prefix_replacement_consecutive_placeholders() {
-        do_binary_test("ABCD", "XY", b"ABCDABCD", b"XYXY\x00\x00\x00\x00", 0, b"ABCDABCD".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_same_length() {
-        do_text_test("ABCD", "WXYZ", b"01ABCD6789012ABCD7890", b"01WXYZ6789012WXYZ7890", 0, b"01ABCD6789012ABCD7890".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_same_length() {
-        do_binary_test("ABCD", "WXYZ", b"01ABCD6789012ABCD7890", b"01WXYZ6789012WXYZ7890", 0, b"01ABCD6789012ABCD7890".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_empty_file() {
-        do_text_test("ABCD", "XY", b"", b"", 0, b"".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_empty_file() {
-        do_binary_test("ABCD", "XY", b"", b"", 0, b"".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_single_char_placeholder() {
-        do_text_test("X", "A", b"0X2X4X6X8", b"0A2A4A6A8", 0, b"0X2X4X6X8".len());
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_single_char_placeholder() {
-        do_binary_test("X", "A", b"0X2X4X6X8", b"0A2A4A6A8", 0, b"0X2X4X6X8".len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_many_placeholders() {
-        let mut before = Vec::new();
+    fn binary_many_placeholders() {
+        let mut source = Vec::new();
         let mut expected = Vec::new();
-        for i in 0..10 {
-            before.extend_from_slice(format!("{:02}ABCD", i).as_bytes());
-            expected.extend_from_slice(format!("{:02}XY", i).as_bytes());
+        for i in 0..10u8 {
+            source.extend_from_slice(&[i + b'0', i + b'0']);
+            source.extend_from_slice(b"ABCD\x00");
+            expected.extend_from_slice(&[i + b'0', i + b'0']);
+            expected.extend_from_slice(b"XY\x00\x00\x00");
         }
-        do_text_test("ABCD", "XY", &before, &expected, 0, before.len());
+        binary_test(b"ABCD", b"XY", &source, &expected, 0, source.len());
+    }
+
+    // Partial-range binary replacements
+
+    #[test]
+    fn binary_partial_range() {
+        binary_test(
+            b"ABCD",
+            b"XY",
+            b"ABCD\x000ABCD\x005ABCD\x000ABCD\x005ABCD\x00",
+            b"0XY\x00\x00",
+            5,
+            10,
+        );
     }
 
     #[test]
-    fn test_binary_prefix_replacement_many_placeholders() {
-        let mut before = Vec::new();
-        let mut expected = Vec::new();
-        for i in 0..10 {
-            before.extend_from_slice(format!("{:02}ABCD\x00", i).as_bytes());
-            expected.extend_from_slice(format!("{:02}XY\x00\x00\x00", i).as_bytes());
-        }
-        do_binary_test("ABCD", "XY", &before, &expected, 0, before.len());
+    fn binary_start_after_prefix() {
+        binary_test(
+            b"ABCD",
+            b"XY",
+            b"ABCD01234ABCD\x0056789",
+            b"34XY\x00\x00\x00\x00\x0056789",
+            5,
+            19,
+        );
     }
 
     #[test]
-    fn test_text_prefix_replacement_longer_prefix() {
-        // Test with a longer replacement (should still work if placeholder is longer)
-        do_text_test("ABCDEFGH", "XYZ", b"01ABCDEFGH234ABCDEFGH567", b"01XYZ234XYZ567", 0, b"01ABCDEFGH234ABCDEFGH567".len());
+    fn binary_start_between_placeholders() {
+        binary_test(
+            b"ABCD",
+            b"XY",
+            b"ABCD012\x003ABCD5678ABCD",
+            b"012\x00\x00\x003XY5678XY\x00\x00\x00\x00",
+            2,
+            21,
+        );
     }
 
     #[test]
-    fn test_binary_prefix_replacement_longer_prefix() {
-        // Test with a longer replacement (should still work if placeholder is longer)
-        do_binary_test("ABCDEFGH", "XYZ", b"01ABCDEFGH234ABCDEFGH567", b"01XYZ234XYZ567\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 0, b"01ABCDEFGH234ABCDEFGH567".len());
+    fn binary_start_at_placeholder() {
+        binary_test(
+            b"ABCD",
+            b"XY",
+            b"01234ABCD\x006789ABCD\x00",
+            b"XY\x00\x00\x006789XY\x00\x00\x00",
+            5,
+            19,
+        );
     }
 
     #[test]
-    fn test_text_prefix_replacement_three_char_to_one() {
-        do_text_test("ABC", "X", b"00ABC11ABC22ABC33", b"00X11X22X33", 0, b"00ABC11ABC22ABC33".len());
+    fn binary_longer_placeholder() {
+        binary_test(
+            b"ABCDEFGH",
+            b"XYZ",
+            b"01ABCDEFGH234ABCDEFGH567",
+            b"01XYZ234XYZ567\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            0,
+            24,
+        );
+    }
+
+    // ── Offset collection ────────────────────────────────────────────
+
+    #[test]
+    fn collect_offsets_basic() {
+        assert_eq!(collect_offsets(b"01ABCD56ABCD", b"ABCD"), vec![2, 8]);
     }
 
     #[test]
-    fn test_binary_prefix_replacement_three_char_to_one() {
-        do_binary_test("ABC", "X", b"00ABC11ABC22ABC33", b"00X11X22X33\x00\x00\x00\x00\x00\x00", 0, b"00ABC11ABC22ABC33".len());
+    fn collect_offsets_none() {
+        assert_eq!(collect_offsets(b"0123456789", b"ABCD"), Vec::<usize>::new());
     }
 
     #[test]
-    fn test_text_prefix_replacement_with_special_chars() {
-        let before = b"{\n  \"path\": \"ABCD/file\",\n  \"root\": \"ABCD\"\n}";
-        do_text_test("ABCD", "XY", before, b"{\n  \"path\": \"XY/file\",\n  \"root\": \"XY\"\n}", 0, before.len());
-    }
-
-    #[test]
-    fn test_text_prefix_replacement_placeholder_at_boundary() {
-        // Placeholder right at the end boundary
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"01234567ABCD";
-        let start = 0;
-        let end = 12; // Includes the placeholder
-        
-        do_text_test(placeholder, prefix, before, b"01234567XY", start, end);
-    }
-
-    #[test]
-    fn test_binary_prefix_replacement_placeholder_at_boundary() {
-        // Placeholder right at the end boundary
-        let placeholder = "ABCD";
-        let prefix = "XY";
-        let before = b"01234567ABCD";
-        let start = 0;
-        let end = 12; // Includes the placeholder
-        
-        do_binary_test(placeholder, prefix, before, b"01234567XY\x00\x00", start, end);
+    fn collect_offsets_consecutive() {
+        assert_eq!(collect_offsets(b"ABCDABCD", b"ABCD"), vec![0, 4]);
     }
 }

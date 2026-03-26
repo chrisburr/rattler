@@ -9,6 +9,8 @@ pub mod inspect;
 pub mod link;
 pub mod list;
 pub mod menu;
+#[cfg(feature = "mount")]
+pub mod mount;
 pub mod run;
 pub mod search;
 pub mod shell_hook;

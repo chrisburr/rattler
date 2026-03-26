@@ -1,315 +1,1080 @@
-use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request
-};
-use libc::{EIO, ENOENT, ENOTDIR, getuid, getgid};
-use rattler_conda_types::package::FileMode;
-use std::{cmp::max, collections::HashMap, ffi::OsStr, fs::{self, File}, mem::take, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, sync::{Mutex, atomic::AtomicU64}, time::{Duration, SystemTime, UNIX_EPOCH}};
-
-
+use libc::{EIO, ENOENT, ENOTDIR};
 use memmap2::Mmap;
+#[cfg(target_os = "macos")]
+use rattler::install::link::copy_and_replace_placeholders_with_offsets;
+use rattler_conda_types::package::{FileMode, PathType};
+use rattler_conda_types::Platform;
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::UNIX_EPOCH,
+};
 
-use crate::{fuse_directory::{FuseFile, FuseMetadata}, prefix_replacement::{binary_prefix_replacement,  text_prefix_replacement}};
+use crate::vfs_ops::current_uid_gid;
 
-const TTL: Duration = Duration::from_secs(5);
+use crate::metadata_tree::{FileNode, MetadataNode};
+use crate::vfs_ops::{ContentSource, DirEntry, FileAttr, FileKind, VfsOps};
 
-fn i64_to_systemtime(time: i64, nanos: i64 ) -> SystemTime {
-    UNIX_EPOCH + Duration::new(time as u64, nanos as u32)
-}
-pub struct VirtualFS{
-    metadata: Vec<FuseMetadata>,
+pub struct VirtualFS {
+    metadata: Vec<MetadataNode>,
     mount_point: PathBuf,
-    open_files: Mutex<HashMap<u64, Mmap>>, 
-    next_fh: AtomicU64
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    platform: Platform,
+    uid: u32,
+    gid: u32,
+    /// Pre-computed replacement offsets for files with prefix placeholders.
+    /// Keyed by inode. Populated eagerly at construction from paths.json
+    /// offsets or by scanning the source file.
+    offset_cache: HashMap<u64, Vec<usize>>,
+    /// Cache for fully materialized + codesigned binary content (macOS only).
+    /// Keyed by inode. Only populated for binary-mode prefix files that need
+    /// ad-hoc re-signing, since codesign requires the full file.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    codesign_cache: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
-impl VirtualFS{
-    
-    pub fn new(metadata: &mut Vec<FuseMetadata>, mount_point: &Path) -> Self{
-        VirtualFS{
-            metadata: take(metadata),
+impl VirtualFS {
+    pub fn new(metadata: Vec<MetadataNode>, mount_point: &Path) -> Self {
+        Self::with_platform(metadata, mount_point, Platform::current())
+    }
+
+    pub(crate) fn with_platform(
+        mut metadata: Vec<MetadataNode>,
+        mount_point: &Path,
+        platform: Platform,
+    ) -> Self {
+        let target_prefix = mount_point.to_string_lossy();
+        let mut offset_cache = HashMap::new();
+
+        // Eagerly compute replacement offsets and text-mode file sizes.
+        for i in 0..metadata.len() {
+            let Some(file) = metadata[i].as_file() else {
+                continue;
+            };
+            let Some(placeholder) = &file.prefix_placeholder else {
+                continue;
+            };
+
+            let ino = (i + 1) as u64;
+            let old_prefix = placeholder.placeholder.as_bytes();
+
+            // Resolve the on-disk cache path, preferring cache_prefix_path
+            // (set for noarch Python files where virtual path differs from cache path).
+            let cache_path = {
+                let p = (*file.cache_base_path).to_path_buf();
+                let prefix = match &file.cache_prefix_path {
+                    Some(cp) => cp.as_path(),
+                    None => &metadata[file.parent].as_directory().unwrap().prefix_path,
+                };
+                p.join(prefix).join(&file.file_name)
+            };
+
+            // Use paths.json offsets if available, otherwise scan the source file
+            let offsets = if let Some(o) = &placeholder.offsets {
+                o.clone()
+            } else {
+                match fs::read(&cache_path) {
+                    Ok(source) => crate::prefix_replacement::collect_offsets(&source, old_prefix),
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to read {} for offset computation: {}",
+                            cache_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            // For text-mode files, compute post-replacement size from arithmetic:
+            // each replacement changes length by (new_prefix - old_prefix) bytes
+            if placeholder.file_mode == FileMode::Text {
+                if let Ok(source_meta) = fs::symlink_metadata(&cache_path) {
+                    let delta =
+                        target_prefix.len() as isize - placeholder.placeholder.len() as isize;
+                    let new_size =
+                        (source_meta.len() as isize + delta * offsets.len() as isize).max(0) as u64;
+                    metadata[i].as_file_mut().unwrap().computed_size = Some(new_size);
+                }
+            }
+
+            offset_cache.insert(ino, offsets);
+        }
+
+        VirtualFS {
+            metadata,
             mount_point: mount_point.to_path_buf(),
-            open_files: Mutex::new(HashMap::new()),
-            next_fh: AtomicU64::new(1),
+            platform,
+            uid: current_uid_gid().0,
+            gid: current_uid_gid().1,
+            offset_cache,
+            codesign_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    fn _getpath(&self, file: &FuseFile) -> PathBuf {
+    /// Validate an inode number and return the 0-based metadata index.
+    fn validate_ino(&self, ino: u64) -> Result<usize, i32> {
+        if ino == 0 || ino > self.metadata.len() as u64 {
+            return Err(ENOENT);
+        }
+        Ok((ino - 1) as usize)
+    }
+
+    /// Build a `FileAttr` with common defaults (uid/gid cached).
+    fn make_attr(&self, ino: u64, size: u64, kind: FileKind, perm: u16) -> FileAttr {
+        FileAttr {
+            ino,
+            size,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            kind,
+            perm,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+        }
+    }
+
+    fn _getpath(&self, file: &FileNode) -> PathBuf {
         let mut path = (*file.cache_base_path).to_path_buf();
-        let parent = self.metadata[file.parent].as_directory().unwrap();
-        path = path.join(&parent.prefix_path); 
+        let prefix = match &file.cache_prefix_path {
+            Some(p) => p.as_path(),
+            None => {
+                &self.metadata[file.parent]
+                    .as_directory()
+                    .unwrap()
+                    .prefix_path
+            }
+        };
+        path = path.join(prefix);
         path.join(&file.file_name)
     }
 
-    fn _getattr(&self, child: &FuseMetadata, child_index: &usize) -> FileAttr{
+    fn _getattr(&self, child: &MetadataNode, child_index: &usize) -> FileAttr {
+        let ino = (child_index + 1) as u64;
         match child {
-            FuseMetadata::Directory(_) => {
-                FileAttr {
-                    ino: INodeNo((child_index + 1) as u64),
-                    size: 0,
-                    blocks: 0,
-                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: FileType::Directory,
-                    perm: 0o755,
-                    nlink: 1,
-                    uid: unsafe { getuid() },
-                    gid: unsafe { getgid() },
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,
+            MetadataNode::Directory(_) => self.make_attr(ino, 0, FileKind::Directory, 0o755),
+            MetadataNode::File(file) => {
+                if let Some(ref content) = file.virtual_content {
+                    return self.make_attr(ino, content.len() as u64, FileKind::RegularFile, 0o775);
                 }
-            },
-            FuseMetadata::File(file) => {
-                let path = self._getpath(file);
 
-                let metadata = fs::metadata(path).unwrap(); // TODO need to handle error
-                
-                FileAttr {
-                    ino: INodeNo((child_index + 1) as u64),
-                    size: metadata.len(),
-                    blocks: metadata.blocks(),
-                    atime: metadata.accessed().unwrap_or(UNIX_EPOCH), // default: 1970-01-01 00:00:00
-                    mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
-                    ctime: i64_to_systemtime(metadata.ctime(), metadata.ctime_nsec()), 
-                    crtime: metadata.created().unwrap_or(UNIX_EPOCH),
-                    kind: FileType::RegularFile,
-                    perm: (metadata.permissions().mode() & 0o777) as u16,
-                    nlink: 1,
-                    uid: unsafe {getuid()} ,
-                    gid: unsafe {getgid()},
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,
+                let path = self._getpath(file);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        let mut attr = FileAttr::from_metadata(&metadata, ino);
+                        // Override size if prefix replacement changes the file length
+                        if let Some(computed) = file.computed_size {
+                            attr.size = computed;
+                        }
+                        attr
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to stat {}: {}", path.display(), e);
+                        self.make_attr(ino, 0, FileKind::RegularFile, 0o644)
+                    }
                 }
+            }
+        }
+    }
+
+    // -- Testable inner methods --
+
+    pub(crate) fn do_lookup(&self, parent_ino: u64, name: &OsStr) -> Result<FileAttr, i32> {
+        let parent_index = self.validate_ino(parent_ino)?;
+
+        let Some(parent_directory) = self.metadata[parent_index].as_directory() else {
+            return Err(ENOTDIR);
+        };
+
+        for child_index in parent_directory.children.iter() {
+            let child = &self.metadata[*child_index];
+            if child.file_name() == name {
+                return Ok(self._getattr(child, child_index));
+            }
+        }
+
+        Err(ENOENT)
+    }
+
+    pub(crate) fn do_getattr(&self, ino: u64) -> Result<FileAttr, i32> {
+        let index = self.validate_ino(ino)?;
+        let entry = &self.metadata[index];
+        Ok(self._getattr(entry, &index))
+    }
+
+    pub(crate) fn do_readlink(&self, ino: u64) -> Result<PathBuf, i32> {
+        let index = self.validate_ino(ino)?;
+        let Some(current_file) = self.metadata[index].as_file() else {
+            return Err(ENOENT);
+        };
+        let path = self._getpath(current_file);
+        fs::read_link(&path).map_err(|e| {
+            tracing::warn!("readlink failed for {}: {}", path.display(), e);
+            EIO
+        })
+    }
+
+    pub(crate) fn do_content_source(&self, ino: u64) -> Result<ContentSource, i32> {
+        let index = self.validate_ino(ino)?;
+
+        let Some(current_file) = self.metadata[index].as_file() else {
+            return Err(ENOENT); // directories don't have readable content
+        };
+
+        if current_file.path_type == PathType::SoftLink {
+            return Err(ENOENT); // symlinks don't have readable content
+        }
+
+        if current_file.virtual_content.is_some() {
+            return Ok(ContentSource::Virtual);
+        }
+
+        if current_file.prefix_placeholder.is_some() {
+            return Ok(ContentSource::Transformed);
+        }
+
+        let path = self._getpath(current_file);
+        Ok(ContentSource::Direct(path))
+    }
+
+    pub(crate) fn do_read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        let index = self.validate_ino(ino)?;
+
+        let Some(current_file) = self.metadata[index].as_file() else {
+            return Ok(vec![]); // directories
+        };
+
+        if current_file.path_type == PathType::SoftLink {
+            return Ok(vec![]); // symlinks
+        }
+
+        // Virtual files (e.g. entry points) are served directly from memory
+        if let Some(ref content) = current_file.virtual_content {
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            return Ok(content[start..end].to_vec());
+        }
+
+        let path = self._getpath(current_file);
+
+        // Files without prefix replacement: read directly from disk
+        if current_file.prefix_placeholder.is_none() {
+            let mut file = File::open(&path).map_err(|e| {
+                tracing::warn!("failed to open {}: {}", path.display(), e);
+                EIO
+            })?;
+            file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                tracing::warn!("failed to seek {}: {}", path.display(), e);
+                EIO
+            })?;
+            let mut buf = vec![0u8; size as usize];
+            let n = file.read(&mut buf).map_err(|e| {
+                tracing::warn!("failed to read {}: {}", path.display(), e);
+                EIO
+            })?;
+            buf.truncate(n);
+            return Ok(buf);
+        }
+
+        // Has prefix placeholder — use ranged replacement
+        let placeholder = current_file.prefix_placeholder.as_ref().unwrap();
+
+        let file = File::open(&path).map_err(|e| {
+            tracing::warn!("failed to open {}: {}", path.display(), e);
+            EIO
+        })?;
+
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            tracing::warn!("failed to memory map {}: {}", path.display(), e);
+            EIO
+        })?;
+
+        let old_prefix = placeholder.placeholder.as_bytes();
+        let new_prefix_str = self.mount_point.to_string_lossy();
+        let new_prefix = new_prefix_str.as_bytes();
+
+        let empty_offsets = Vec::new();
+        let offsets = self.offset_cache.get(&ino).unwrap_or(&empty_offsets);
+
+        let start = offset as usize;
+        let end = start + size as usize;
+
+        match placeholder.file_mode {
+            FileMode::Binary => {
+                // macOS binaries need codesign after prefix replacement.
+                // Codesign rehashes every page so it can't be done as a ranged
+                // operation. Materialize + resign once, cache for subsequent reads.
+                // The codesign module is compiled only on macOS — other targets
+                // fall through to `binary_ranged_read` directly.
+                #[cfg(target_os = "macos")]
+                if self.platform.is_osx() {
+                    // Fast path: serve from cache
+                    if let Some(cached) = self.codesign_cache.lock().unwrap().get(&ino) {
+                        let s = start.min(cached.len());
+                        let e = (s + size as usize).min(cached.len());
+                        return Ok(cached[s..e].to_vec());
+                    }
+
+                    // Slow path: materialize, resign, cache
+                    let target_prefix = self.mount_point.to_string_lossy();
+                    let mut output = Vec::with_capacity(mmap.len());
+
+                    let result = copy_and_replace_placeholders_with_offsets(
+                        &mmap,
+                        &mut output,
+                        &placeholder.placeholder,
+                        &target_prefix,
+                        &self.platform,
+                        placeholder.file_mode,
+                        offsets,
+                    );
+
+                    if result.is_err() {
+                        let s = start.min(mmap.len());
+                        let e = (s + size as usize).min(mmap.len());
+                        return Ok(mmap[s..e].to_vec());
+                    }
+
+                    if let Err(e) = crate::codesign::adhoc_resign(&mut output) {
+                        tracing::warn!("ad-hoc re-signing failed for {}: {}", path.display(), e);
+                    }
+
+                    let s = start.min(output.len());
+                    let e = (s + size as usize).min(output.len());
+                    let result = output[s..e].to_vec();
+                    self.codesign_cache.lock().unwrap().insert(ino, output);
+                    return Ok(result);
+                }
+
+                Ok(crate::prefix_replacement::binary_ranged_read(
+                    &mmap, old_prefix, new_prefix, offsets, start, end,
+                ))
+            }
+            FileMode::Text => Ok(crate::prefix_replacement::text_ranged_read(
+                &mmap, old_prefix, new_prefix, offsets, start, end,
+            )),
+        }
+    }
+
+    pub(crate) fn do_readdir(&self, ino: u64, offset: u64) -> Result<Vec<DirEntry>, i32> {
+        let index = self.validate_ino(ino)?;
+
+        let Some(current_directory) = self.metadata[index].as_directory() else {
+            return Err(ENOTDIR);
+        };
+
+        let mut entries = Vec::new();
+
+        if offset == 0 {
+            entries.push(DirEntry {
+                ino: (current_directory.parent + 1) as u64,
+                kind: FileKind::Directory,
+                name: OsString::from(".."),
+            });
+        }
+        if offset <= 1 {
+            entries.push(DirEntry {
+                ino,
+                kind: FileKind::Directory,
+                name: OsString::from("."),
+            });
+        }
+
+        for child_index in current_directory
+            .children
+            .iter()
+            .skip(offset.saturating_sub(2) as usize)
+        {
+            let child = &self.metadata[*child_index];
+            let kind = match child {
+                MetadataNode::Directory(_) => FileKind::Directory,
+                MetadataNode::File(f) => {
+                    if f.path_type == PathType::SoftLink {
+                        FileKind::Symlink
+                    } else {
+                        FileKind::RegularFile
+                    }
+                }
+            };
+            entries.push(DirEntry {
+                ino: (child_index + 1) as u64,
+                kind,
+                name: child.file_name().to_owned(),
+            });
+        }
+
+        Ok(entries)
+    }
+}
+
+impl VfsOps for VirtualFS {
+    fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, i32> {
+        self.do_lookup(parent, name)
+    }
+    fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
+        self.do_getattr(ino)
+    }
+    fn readlink(&self, ino: u64) -> Result<PathBuf, i32> {
+        self.do_readlink(ino)
+    }
+    fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        self.do_read(ino, offset, size)
+    }
+    fn content_source(&self, ino: u64) -> Result<ContentSource, i32> {
+        self.do_content_source(ino)
+    }
+    fn readdir(&self, ino: u64, offset: u64) -> Result<Vec<DirEntry>, i32> {
+        self.do_readdir(ino, offset)
+    }
+
+    fn ino_to_path(&self, ino: u64) -> Result<PathBuf, i32> {
+        let index = self.validate_ino(ino)?;
+        let entry = &self.metadata[index];
+
+        // Root directory → empty path
+        if index == 0 {
+            return Ok(PathBuf::new());
+        }
+
+        match entry {
+            MetadataNode::Directory(dir) => {
+                // prefix_path is like "./lib/python3.14" — strip the "./" prefix
+                let p = dir
+                    .prefix_path
+                    .strip_prefix("./")
+                    .unwrap_or(&dir.prefix_path);
+                Ok(p.to_path_buf())
+            }
+            MetadataNode::File(file) => {
+                let parent = &self.metadata[file.parent];
+                let parent_dir = parent.as_directory().ok_or(ENOENT)?;
+                let parent_path = parent_dir
+                    .prefix_path
+                    .strip_prefix("./")
+                    .unwrap_or(&parent_dir.prefix_path);
+                Ok(parent_path.join(&file.file_name))
             }
         }
     }
 }
 
-impl Filesystem for VirtualFS {
-    fn lookup(&self, 
-        _req: &Request, 
-        parent: INodeNo, 
-        name: &OsStr, 
-        reply: ReplyEntry
-    ) {
-        if parent > fuser::INodeNo(self.metadata.len() as u64) {
-            reply.error(Errno::from_i32(ENOENT));
-            return
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{new_empty_tree, path_parse};
+    use rattler_conda_types::package::{
+        FileMode, PathType, PathsEntry, PathsJson, PrefixPlaceholder,
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+    use tempfile::TempDir;
 
-        let Some(parent_directory) = self.metadata[(parent-1) as usize].as_directory() else {
-            reply.error(Errno::from_i32(ENOTDIR));
-            return
+    /// Build a test fixture:
+    /// ```text
+    /// tmpdir/
+    /// ├── lib/
+    /// │   ├── libfoo.so          "hello world"
+    /// │   ├── libfoo.so.1 → libfoo.so
+    /// │   └── libbar.so → gone.so   (dangling)
+    /// ├── etc/
+    /// │   └── config.txt         "/old/prefix/path/to/thing"
+    /// └── bin/
+    ///     └── run.sh             "#!/old/prefix/bin/python\nprint('hi')"
+    /// ```
+    fn create_fixture() -> (TempDir, VirtualFS) {
+        let tmpdir = TempDir::new().unwrap();
+        let cache_path = tmpdir.path();
+
+        // Create directories
+        fs::create_dir_all(cache_path.join("lib")).unwrap();
+        fs::create_dir_all(cache_path.join("etc")).unwrap();
+        fs::create_dir_all(cache_path.join("bin")).unwrap();
+
+        // Create files
+        fs::write(cache_path.join("lib/libfoo.so"), b"hello world").unwrap();
+        symlink("libfoo.so", cache_path.join("lib/libfoo.so.1")).unwrap();
+        symlink("gone.so", cache_path.join("lib/libbar.so")).unwrap();
+        fs::write(
+            cache_path.join("etc/config.txt"),
+            b"/old/prefix/path/to/thing",
+        )
+        .unwrap();
+        fs::write(
+            cache_path.join("bin/run.sh"),
+            b"#!/old/prefix/bin/python\nprint('hi')",
+        )
+        .unwrap();
+
+        // Build PathsJson
+        let paths_json = PathsJson {
+            paths: vec![
+                PathsEntry {
+                    relative_path: PathBuf::from("lib/libfoo.so"),
+                    path_type: PathType::HardLink,
+                    prefix_placeholder: None,
+                    no_link: false,
+                    sha256: None,
+                    size_in_bytes: None,
+                    executable: None,
+                },
+                PathsEntry {
+                    relative_path: PathBuf::from("lib/libfoo.so.1"),
+                    path_type: PathType::SoftLink,
+                    prefix_placeholder: None,
+                    no_link: false,
+                    sha256: None,
+                    size_in_bytes: None,
+                    executable: None,
+                },
+                PathsEntry {
+                    relative_path: PathBuf::from("lib/libbar.so"),
+                    path_type: PathType::SoftLink,
+                    prefix_placeholder: None,
+                    no_link: false,
+                    sha256: None,
+                    size_in_bytes: None,
+                    executable: None,
+                },
+                PathsEntry {
+                    relative_path: PathBuf::from("etc/config.txt"),
+                    path_type: PathType::HardLink,
+                    prefix_placeholder: Some(PrefixPlaceholder {
+                        file_mode: FileMode::Text,
+                        placeholder: "/old/prefix".to_string(),
+                        offsets: None,
+                        shebang_length: None,
+                    }),
+                    no_link: false,
+                    sha256: None,
+                    size_in_bytes: None,
+                    executable: None,
+                },
+                PathsEntry {
+                    relative_path: PathBuf::from("bin/run.sh"),
+                    path_type: PathType::HardLink,
+                    prefix_placeholder: Some(PrefixPlaceholder {
+                        file_mode: FileMode::Text,
+                        placeholder: "/old/prefix".to_string(),
+                        offsets: None,
+                        shebang_length: None,
+                    }),
+                    no_link: false,
+                    sha256: None,
+                    size_in_bytes: None,
+                    executable: None,
+                },
+            ],
+            paths_version: 1,
+            has_executable: None,
         };
 
+        let (mut env_paths, mut dir_indices) = new_empty_tree();
+        path_parse(
+            &paths_json,
+            cache_path,
+            None,
+            &mut env_paths,
+            &mut dir_indices,
+        );
 
-        for child_index in parent_directory.children.iter() {
-            let child = &self.metadata[*child_index];
+        let mount_point = PathBuf::from("/new/prefix");
+        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
 
-            if child.file_name() != name {
-               continue
-            }
-
-            let attr = self._getattr(child, child_index);
-
-            reply.entry(&TTL, &attr, fuser::Generation(0));
-            
-            return
-        } 
-
-        reply.error(Errno::from_i32(ENOENT));
+        (tmpdir, vfs)
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if ino > fuser::INodeNo(self.metadata.len() as u64) {
-            reply.error(Errno::from_i32(ENOENT));
-            return
-        }
+    // --- lookup tests ---
 
-        let index = (ino -1) as usize;
-
-        let entry = &self.metadata[index];
-        let attr = self._getattr(&entry, &index);
-
-        reply.attr(&TTL, &attr);
+    #[test]
+    fn test_lookup_directory() {
+        let (_tmp, vfs) = create_fixture();
+        let attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        assert_eq!(attr.kind, FileKind::Directory);
     }
 
-    //TODO 
-    fn open(
-        &self, 
-        _req: &Request, 
-        ino: INodeNo,
-        _flags: OpenFlags, 
-        reply: ReplyOpen
-    ) {
-        println!("open was called with ino {ino}");  // open from the cache, keep track of fs object 
-
-        if ino > fuser::INodeNo(self.metadata.len() as u64) {
-            reply.error(Errno::from_i32(ENOENT));
-            return
-        }
-
-        let index = (ino -1) as usize;
-
-        let Some(current_file) = self.metadata[index].as_file() else {
-            reply.opened(fuser::FileHandle(0), FopenFlags::empty());
-            return
-        };
-
-        let path = self._getpath(current_file);
-
-        let Ok(file) = File::open(&path) else {
-            println!("file didn't open {:#?}", &path);
-            reply.error(Errno::from_i32(EIO));
-            return
-        };
-
-        // don't the contents just go out of scope & dropped, What is the usefullness of these lines? - i assumed so commented out, just have to recheck?
-        // let mut contents: Vec<u8> = Vec::new();
-        // file.read_to_end(&mut contents);
-
-        let mmap = unsafe { Mmap::map(&file).expect(&format!("failed to memmory map {path:#?}")) };
-
-        let fh = self.next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let current_file = self.metadata[index].as_file_mut().expect("already used as a file");
-
-        if let Some(prefix_placeholder) = &mut current_file.prefix_placeholder {
-            prefix_placeholder.fill_offsets(&mmap);
-        };
-
-        self.open_files.lock().unwrap().insert(fh, mmap);
-
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+    #[test]
+    fn test_lookup_file() {
+        let (_tmp, vfs) = create_fixture();
+        // First find lib directory
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let lib_ino = lib_attr.ino;
+        // Then find file in lib
+        let attr = vfs.do_lookup(lib_ino, OsStr::new("libfoo.so")).unwrap();
+        assert_eq!(attr.kind, FileKind::RegularFile);
+        assert!(attr.size > 0);
     }
 
-    fn release(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ){
-        println!("closed inode {} at fh{}", ino, fh);
-        if fh.eq(&FileHandle(0)) {
-            reply.ok();
-            return 
-        }
-
-        let Some(_) = self.open_files.lock().unwrap().remove(&fh) else {
-            println!("releasing a non existing file");
-            reply.error(Errno::from_i32(EIO));
-            return
-        };
-        
-        reply.ok();
+    #[test]
+    fn test_lookup_not_found() {
+        let (_tmp, vfs) = create_fixture();
+        assert_eq!(
+            vfs.do_lookup(1, OsStr::new("nonexistent")).unwrap_err(),
+            ENOENT
+        );
     }
 
-    fn read(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        offset: u64,
-        size: u32,
-        _flags: OpenFlags,
-        _lock: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        let index = (ino. -1) as usize;
-
-        let Some(current_file) = self.metadata[index].as_file() else {
-            reply.error(Errno::from_i32(EIO));
-            return
-        };
-
-        println!("reading from {}, with offset {} and size {}", fh, offset, size);
-        let lock = self.open_files.lock().unwrap();
-        let Some(file) = lock.get(&fh) else{
-            println!("error in file {}", &fh);
-            reply.error(Errno::from_i32(EIO));
-            return
-        };
-
-        let start = offset as usize;
-        let end: usize = start + size as usize;
-        
-        match &current_file.prefix_placeholder {
-            Some(placeholder) => {
-                // let mut buffer = vec![0 as u8; size as usize];
-                let buffer: Vec<u8>;
-                match placeholder.file_mode{
-                    FileMode::Text => {
-                        buffer = text_prefix_replacement(placeholder, start, end, size as usize, file, &self.mount_point);
-                    },
-                    FileMode::Binary => {
-                        buffer = binary_prefix_replacement(placeholder, start, end, size as usize, file, &self.mount_point);
-                    },
-                }
-                reply.data(&buffer);
-            },
-            None =>  {
-                let buffer = Vec::from_iter(file[start..end].iter().copied());
-            
-                reply.data(&buffer);
-            }
-        }
+    #[test]
+    fn test_lookup_not_directory() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        // Try to lookup child of a file
+        assert_eq!(
+            vfs.do_lookup(file_attr.ino, OsStr::new("child"))
+                .unwrap_err(),
+            ENOTDIR
+        );
     }
 
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        if ino > fuser::INodeNo(self.metadata.len() as u64) {
-            reply.error(Errno::from_i32(NonZeroI32::new(ENOENT).unwrap().into()));
-            return
-        }
+    // --- getattr tests ---
 
-        let Some(current_directory) = self.metadata[(ino-1) as usize].as_directory() else {
-            reply.error(Errno::from_i32(NonZeroI32::new(ENOTDIR).unwrap().into()));
-            return
+    #[test]
+    fn test_getattr_root() {
+        let (_tmp, vfs) = create_fixture();
+        let attr = vfs.do_getattr(1).unwrap();
+        assert_eq!(attr.kind, FileKind::Directory);
+    }
+
+    #[test]
+    fn test_getattr_regular_file() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        let attr = vfs.do_getattr(file_attr.ino).unwrap();
+        assert_eq!(attr.kind, FileKind::RegularFile);
+        assert_eq!(attr.size, 11); // "hello world"
+    }
+
+    #[test]
+    fn test_getattr_symlink() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so.1"))
+            .unwrap();
+        assert_eq!(sym_attr.kind, FileKind::Symlink);
+    }
+
+    #[test]
+    fn test_getattr_dangling_symlink() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libbar.so"))
+            .unwrap();
+        // dangling symlink still reports as symlink via symlink_metadata
+        assert_eq!(sym_attr.kind, FileKind::Symlink);
+    }
+
+    #[test]
+    fn test_getattr_invalid_ino() {
+        let (_tmp, vfs) = create_fixture();
+        assert_eq!(vfs.do_getattr(9999).unwrap_err(), ENOENT);
+    }
+
+    // --- readlink tests ---
+
+    #[test]
+    fn test_readlink_valid() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so.1"))
+            .unwrap();
+        let target = vfs.do_readlink(sym_attr.ino).unwrap();
+        assert_eq!(target, PathBuf::from("libfoo.so"));
+    }
+
+    #[test]
+    fn test_readlink_dangling() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libbar.so"))
+            .unwrap();
+        let target = vfs.do_readlink(sym_attr.ino).unwrap();
+        assert_eq!(target, PathBuf::from("gone.so"));
+    }
+
+    #[test]
+    fn test_readlink_regular_file() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        // read_link on a regular file should fail
+        assert_eq!(vfs.do_readlink(file_attr.ino), Err(EIO));
+    }
+
+    #[test]
+    fn test_readlink_directory() {
+        let (_tmp, vfs) = create_fixture();
+        // readlink on a directory should fail (not a file)
+        assert_eq!(vfs.do_readlink(1), Err(ENOENT));
+    }
+
+    // --- read tests ---
+
+    #[test]
+    fn test_read_regular_file() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        let data = vfs.do_read(file_attr.ino, 0, 1024).unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn test_read_with_offset() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        let data = vfs.do_read(file_attr.ino, 6, 5).unwrap();
+        assert_eq!(data, b"world");
+    }
+
+    #[test]
+    fn test_read_with_prefix_replacement() {
+        let (_tmp, vfs) = create_fixture();
+        let etc_attr = vfs.do_lookup(1, OsStr::new("etc")).unwrap();
+        let config_attr = vfs
+            .do_lookup(etc_attr.ino, OsStr::new("config.txt"))
+            .unwrap();
+        let data = vfs.do_read(config_attr.ino, 0, 4096).unwrap();
+        let content = String::from_utf8(data).unwrap();
+        assert!(
+            content.contains("/new/prefix"),
+            "expected /new/prefix in: {content}"
+        );
+        assert!(
+            !content.contains("/old/prefix"),
+            "unexpected /old/prefix in: {content}"
+        );
+    }
+
+    #[test]
+    fn test_getattr_text_prefix_reports_correct_size() {
+        let (_tmp, vfs) = create_fixture();
+        let etc_attr = vfs.do_lookup(1, OsStr::new("etc")).unwrap();
+        let config_attr = vfs
+            .do_lookup(etc_attr.ino, OsStr::new("config.txt"))
+            .unwrap();
+
+        // getattr size should match actual content length, not on-disk size
+        let data = vfs.do_read(config_attr.ino, 0, u32::MAX).unwrap();
+        assert_eq!(
+            config_attr.size,
+            data.len() as u64,
+            "getattr size ({}) != read content length ({})",
+            config_attr.size,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_getattr_shebang_prefix_reports_correct_size() {
+        let (_tmp, vfs) = create_fixture();
+        let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
+        let run_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("run.sh")).unwrap();
+
+        // Shebang file: getattr size should match actual content length
+        let data = vfs.do_read(run_attr.ino, 0, u32::MAX).unwrap();
+        assert_eq!(
+            run_attr.size,
+            data.len() as u64,
+            "getattr size ({}) != read content length ({})",
+            run_attr.size,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_read_directory_returns_empty() {
+        let (_tmp, vfs) = create_fixture();
+        let data = vfs.do_read(1, 0, 1024).unwrap(); // root directory
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_read_symlink_returns_empty() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so.1"))
+            .unwrap();
+        let data = vfs.do_read(sym_attr.ino, 0, 1024).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_read_dangling_symlink_returns_empty() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let sym_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libbar.so"))
+            .unwrap();
+        let data = vfs.do_read(sym_attr.ino, 0, 1024).unwrap();
+        assert!(data.is_empty());
+    }
+
+    // --- readdir tests ---
+
+    #[test]
+    fn test_readdir_root() {
+        let (_tmp, vfs) = create_fixture();
+        let entries = vfs.do_readdir(1, 0).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+        assert!(names.contains(&".."));
+        assert!(names.contains(&"."));
+        assert!(names.contains(&"lib"));
+        assert!(names.contains(&"etc"));
+        assert!(names.contains(&"bin"));
+    }
+
+    #[test]
+    fn test_readdir_subdirectory() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let entries = vfs.do_readdir(lib_attr.ino, 0).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+        assert!(names.contains(&"libfoo.so"));
+        assert!(names.contains(&"libfoo.so.1"));
+        assert!(names.contains(&"libbar.so"));
+    }
+
+    #[test]
+    fn test_readdir_reports_symlink_kind() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let entries = vfs.do_readdir(lib_attr.ino, 0).unwrap();
+
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("entry {name} not found"))
+        };
+        assert_eq!(find("libfoo.so").kind, FileKind::RegularFile);
+        assert_eq!(find("libfoo.so.1").kind, FileKind::Symlink);
+        assert_eq!(find("libbar.so").kind, FileKind::Symlink);
+    }
+
+    #[test]
+    fn test_readdir_with_offset() {
+        let (_tmp, vfs) = create_fixture();
+        let all = vfs.do_readdir(1, 0).unwrap();
+        let skipped = vfs.do_readdir(1, 3).unwrap();
+        assert!(skipped.len() < all.len());
+    }
+
+    #[test]
+    fn test_readdir_not_directory() {
+        let (_tmp, vfs) = create_fixture();
+        let lib_attr = vfs.do_lookup(1, OsStr::new("lib")).unwrap();
+        let file_attr = vfs
+            .do_lookup(lib_attr.ino, OsStr::new("libfoo.so"))
+            .unwrap();
+        assert_eq!(vfs.do_readdir(file_attr.ino, 0), Err(ENOTDIR));
+    }
+
+    // --- virtual file tests ---
+
+    fn create_fixture_with_virtual_files() -> (TempDir, VirtualFS) {
+        use rattler::install::PythonInfo;
+        use rattler_conda_types::Version;
+        use std::str::FromStr;
+
+        let tmpdir = TempDir::new().unwrap();
+        let cache_path = tmpdir.path();
+
+        fs::create_dir_all(cache_path.join("bin")).unwrap();
+        fs::write(cache_path.join("bin/real_tool"), b"real content").unwrap();
+
+        let paths_json = PathsJson {
+            paths: vec![PathsEntry {
+                relative_path: PathBuf::from("bin/real_tool"),
+                path_type: PathType::HardLink,
+                prefix_placeholder: None,
+                no_link: false,
+                sha256: None,
+                size_in_bytes: None,
+                executable: None,
+            }],
+            paths_version: 1,
+            has_executable: None,
         };
 
-    
-        if offset == 0 {
-            if reply.add(INodeNo((current_directory.parent + 1) as u64), 1, FileType::Directory, "..") {
-                reply.ok();
-                return
-            }
-        }
-        if offset <= 1 {
-            if reply.add(INodeNo(ino.into()), 2, FileType::Directory, ".") {
-                reply.ok();
-                return
-            }
-        }
+        let (mut env_paths, mut dir_indices) = new_empty_tree();
+        path_parse(
+            &paths_json,
+            cache_path,
+            None,
+            &mut env_paths,
+            &mut dir_indices,
+        );
 
-        for (i, child_index) in current_directory.children.iter().enumerate().skip(max(offset - 2, 0)  as usize) {
-            // i + 1 means the index of the next entry
-            // if the entry is added, then break the loop
-            let child = &self.metadata[*child_index];
+        // Add a virtual entry point
+        let python_info = PythonInfo::from_version(
+            &Version::from_str("3.11.0").unwrap(),
+            None,
+            Platform::Linux64,
+        )
+        .unwrap();
+        let ep = rattler_conda_types::package::EntryPoint::from_str("mytool = mymod:main").unwrap();
+        crate::add_entry_points(
+            &[ep],
+            "/new/prefix",
+            &python_info,
+            &mut env_paths,
+            &mut dir_indices,
+        );
 
-            let kind = match child {
-                FuseMetadata::Directory(_) => { FileType::Directory },
-                FuseMetadata::File(_) => { FileType::RegularFile }
-            };
+        let vfs = VirtualFS::with_platform(env_paths, Path::new("/new/prefix"), Platform::Linux64);
+        (tmpdir, vfs)
+    }
 
-            if reply.add(INodeNo((child_index + 1) as u64), (i + 3) as u64, kind, child.file_name()) {
+    #[test]
+    fn test_lookup_entry_point() {
+        let (_tmp, vfs) = create_fixture_with_virtual_files();
+        let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
+        let ep_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("mytool")).unwrap();
+        assert_eq!(ep_attr.kind, FileKind::RegularFile);
+        assert!(ep_attr.size > 0);
+    }
 
-                break
-            }
+    #[test]
+    fn test_getattr_virtual_file() {
+        let (_tmp, vfs) = create_fixture_with_virtual_files();
+        let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
+        let ep_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("mytool")).unwrap();
+        assert_eq!(ep_attr.kind, FileKind::RegularFile);
+        assert_eq!(ep_attr.perm, 0o775); // executable
+        assert!(ep_attr.size > 0);
+    }
 
-        }
-        reply.ok();
+    /// Noarch Python packages store scripts under `python-scripts/` on disk
+    /// but expose them as `bin/` in the virtual tree. When paths.json has no
+    /// precomputed offsets, the VFS must resolve the *cache* path (via
+    /// `cache_prefix_path`) instead of the virtual parent directory path.
+    /// Regression test for prefix-replacement warnings on noarch entry-point
+    /// scripts (e.g. "failed to read …/bin/script for offset computation").
+    #[test]
+    fn test_noarch_prefix_replacement_uses_cache_path() {
+        use rattler::install::PythonInfo;
+        use rattler_conda_types::Version;
+        use std::str::FromStr;
+
+        let tmpdir = TempDir::new().unwrap();
+        let cache_path = tmpdir.path();
+
+        // On disk the file lives under python-scripts/ (the raw package layout)
+        fs::create_dir_all(cache_path.join("python-scripts")).unwrap();
+        let script_content = b"#!/old/prefix/bin/python\nprint('hello')";
+        fs::write(cache_path.join("python-scripts/myscript"), script_content).unwrap();
+
+        // Build PathsJson with a prefix placeholder but NO precomputed offsets
+        let paths_json = PathsJson {
+            paths: vec![PathsEntry {
+                relative_path: PathBuf::from("python-scripts/myscript"),
+                path_type: PathType::HardLink,
+                prefix_placeholder: Some(PrefixPlaceholder {
+                    file_mode: FileMode::Text,
+                    placeholder: "/old/prefix".to_string(),
+                    offsets: None,
+                    shebang_length: None,
+                }),
+                no_link: false,
+                sha256: None,
+                size_in_bytes: None,
+                executable: None,
+            }],
+            paths_version: 1,
+            has_executable: None,
+        };
+
+        let python_info = PythonInfo::from_version(
+            &Version::from_str("3.11.0").unwrap(),
+            None,
+            Platform::Linux64,
+        )
+        .unwrap();
+
+        let (mut env_paths, mut dir_indices) = new_empty_tree();
+        path_parse(
+            &paths_json,
+            cache_path,
+            Some(&python_info),
+            &mut env_paths,
+            &mut dir_indices,
+        );
+
+        let mount_point = PathBuf::from("/new/prefix");
+        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
+
+        // The file should appear under bin/ in the virtual tree
+        let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
+        let script_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("myscript")).unwrap();
+
+        // Read should perform prefix replacement successfully
+        let data = vfs.do_read(script_attr.ino, 0, u32::MAX).unwrap();
+        let content = String::from_utf8(data.clone()).unwrap();
+        assert!(
+            content.contains("/new/prefix"),
+            "expected /new/prefix in: {content}"
+        );
+        assert!(
+            !content.contains("/old/prefix"),
+            "unexpected /old/prefix in: {content}"
+        );
+
+        // getattr size should match actual read content length
+        assert_eq!(
+            script_attr.size,
+            data.len() as u64,
+            "getattr size ({}) != read content length ({})",
+            script_attr.size,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn test_read_virtual_file() {
+        let (_tmp, vfs) = create_fixture_with_virtual_files();
+        let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
+        let ep_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("mytool")).unwrap();
+        let data = vfs.do_read(ep_attr.ino, 0, u32::MAX).unwrap();
+        assert!(!data.is_empty());
+
+        let content = String::from_utf8(data).unwrap();
+        assert!(
+            content.contains("#!/new/prefix/bin/python3.11"),
+            "shebang missing: {content}"
+        );
+        assert!(
+            content.contains("from mymod import"),
+            "import missing: {content}"
+        );
+        assert!(
+            content.contains("main()"),
+            "function call missing: {content}"
+        );
     }
 }

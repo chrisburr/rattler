@@ -13,6 +13,7 @@ channels = [
 # overrides the -O0 required by jitterentropy-base.c, causing a build failure.
 [package.build.config]
 env = { AWS_LC_SYS_CMAKE_BUILDER = "1" }
+extra-args = ["--features", "mount"]
 
 [package.target.linux.build-dependencies]
 cmake = ">=3,<4"

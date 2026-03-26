@@ -55,6 +55,8 @@ enum Command {
     Run(commands::run::Opt),
     Extract(commands::extract::Opt),
     Link(commands::link::Opt),
+    #[cfg(feature = "mount")]
+    Mount(commands::mount::Opt),
     Upload(Box<rattler_upload::upload::opt::UploadOpts>),
     List(commands::list::Opt),
 }
@@ -119,6 +121,8 @@ async fn async_main() -> miette::Result<()> {
         Command::Run(opts) => commands::run::run(opts).await,
         Command::Extract(opts) => commands::extract::extract(opts).await,
         Command::Link(opts) => commands::link::link(opts).await,
+        #[cfg(feature = "mount")]
+        Command::Mount(opts) => commands::mount::mount(opts).await,
         Command::Upload(opts) => rattler_upload::upload_from_args(*opts).await,
     }
 }

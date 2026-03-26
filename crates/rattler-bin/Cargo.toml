@@ -23,6 +23,7 @@ native-tls = [
   "rattler_repodata_gateway/native-tls",
   "rattler_networking/native-tls",
   "rattler_cache/native-tls",
+  "rattler_fs?/native-tls",
 ]
 rustls-tls = [
   "reqwest/rustls-tls",
@@ -31,9 +32,12 @@ rustls-tls = [
   "rattler_repodata_gateway/rustls-tls",
   "rattler_networking/rustls-tls",
   "rattler_cache/rustls-tls",
+  "rattler_fs?/rustls-tls",
 ]
 s3 = ["rattler_networking/s3", "rattler_upload/s3"]
 gcs = ["rattler_networking/gcs"]
+# Opt-in `rattler mount` subcommand.
+mount = ["dep:rattler_fs", "dep:rattler_lock"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -61,6 +65,8 @@ rattler_solve = { workspace = true, default-features = false, features = [
 ] }
 rattler_virtual_packages = { workspace = true, default-features = false }
 rattler_cache = { workspace = true, default-features = false }
+rattler_fs = { path = "../rattler_fs", optional = true }
+rattler_lock = { workspace = true, optional = true }
 rattler_menuinst = { workspace = true, default-features = false }
 rattler_package_streaming = { workspace = true, default-features = false, features = [
   "reqwest",

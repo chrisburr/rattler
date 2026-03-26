@@ -18,3 +18,5 @@ ignore-hidden = false
 strat = "strat"
 haa = "haa"
 intoto = "intoto"
+ACCES = "ACCES"     # NFS3ERR_ACCES / libc::EACCES
+NFS3ERR_ACCES = "NFS3ERR_ACCES"
