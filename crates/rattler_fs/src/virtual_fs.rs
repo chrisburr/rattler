@@ -541,7 +541,6 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 },
                 PathsEntry {
                     relative_path: PathBuf::from("lib/libfoo.so.1"),
@@ -550,7 +549,6 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 },
                 PathsEntry {
                     relative_path: PathBuf::from("lib/libbar.so"),
@@ -559,7 +557,6 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 },
                 PathsEntry {
                     relative_path: PathBuf::from("etc/config.txt"),
@@ -573,7 +570,6 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 },
                 PathsEntry {
                     relative_path: PathBuf::from("bin/run.sh"),
@@ -587,11 +583,9 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 },
             ],
             paths_version: 1,
-            has_executable: None,
         };
 
         let (mut env_paths, mut dir_indices) = new_empty_tree();
@@ -933,10 +927,8 @@ mod tests {
                 no_link: false,
                 sha256: None,
                 size_in_bytes: None,
-                executable: None,
             }],
             paths_version: 1,
-            has_executable: None,
         };
 
         let (mut env_paths, mut dir_indices) = new_empty_tree();
@@ -1021,10 +1013,8 @@ mod tests {
                 no_link: false,
                 sha256: None,
                 size_in_bytes: None,
-                executable: None,
             }],
             paths_version: 1,
-            has_executable: None,
         };
 
         let python_info = PythonInfo::from_version(

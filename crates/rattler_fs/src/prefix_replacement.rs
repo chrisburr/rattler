@@ -265,8 +265,8 @@ pub fn collect_binary_offsets(source: &[u8], placeholder: &[u8]) -> Vec<Vec<usiz
     // Close the last group — find the NUL after the last prefix
     if !current_group.is_empty() {
         let last_end = current_group.last().unwrap() + placeholder.len();
-        let nul_pos = memchr::memchr(b'\0', &source[last_end..])
-            .map_or(source.len(), |p| last_end + p);
+        let nul_pos =
+            memchr::memchr(b'\0', &source[last_end..]).map_or(source.len(), |p| last_end + p);
         current_group.push(nul_pos);
         groups.push(current_group);
     }

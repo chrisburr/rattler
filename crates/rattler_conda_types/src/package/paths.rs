@@ -3,8 +3,6 @@ use crate::{
     package::has_prefix::HasPrefixEntry,
     package::{Files, HasPrefix, NoLink, NoSoftlink},
 };
-use memchr::memmem;
-use memmap2::Mmap;
 use rattler_digest::serde::SerializableHash;
 use rattler_macros::sorted;
 use serde::{Deserialize, Serialize, Serializer};
@@ -219,49 +217,6 @@ pub struct PrefixPlaceholder {
     pub shebang_length: Option<usize>,
 }
 
-impl PrefixPlaceholder {
-    /// A new PrefixPlaceholder 
-    pub fn new(file_mode: FileMode, placeholder: String) -> Self{
-        PrefixPlaceholder { 
-            file_mode, 
-            placeholder,
-            offsets: Some(vec![]),
-        }
-    }
-
-    pub fn get_or_collect_offsets(&self, file: &Mmap) -> Vec<usize> {
-        match self.offsets {
-            Some(offset) => {offset},
-            None => {
-                self.fill_offsets(file);
-                self.offsets.unwrap()
-            },
-        }
-    }
-    // using this function should result in some type of call back up to notify the paths.json should vbe updated & saved
-    /// The function to 
-    pub fn fill_offsets(&mut self, open_file: &Mmap) {
-        // read through the open file and fill in the offsets to the offsets vector
-        let mut found_offsets: Vec<usize> =  memmem::find_iter(open_file, &self.placeholder).collect();
-
-        // if found_offsets.is_empty() || Some(found_offsets) == self.offsets {
-        //     // There were no (new) offsets in the open file
-        //     return false; 
-        // }
-
-        match &mut self.offsets {
-            Some(offset) => {
-                offset.append(&mut found_offsets)
-            },
-            None => {
-                // there is no list in the offsets yet so it might have been v1/ empty v2 //
-                self.offsets = Some(found_offsets)
-            }
-        };
-    }
-
-}
-
 /// A single entry in the `paths.json` file.
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,27 +254,6 @@ pub struct PathsEntry {
     /// This entry is present in version 1 and up of the paths.json file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_in_bytes: Option<u64>,
-}
-
-/// Byte offsets where the prefix placeholder appears in a file.
-///
-/// The format depends on the file mode:
-/// - **Text**: a flat list of byte positions (`[10, 45, 100]`).
-/// - **Binary**: grouped by c-string — each inner array lists the prefix
-///   offsets followed by the position of the NUL terminator
-///   (`[[5, 39], [22, 30, 39]]`).
-///
-/// The two representations are self-describing in JSON: a flat array of
-/// numbers vs. an array of arrays.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(untagged)]
-pub enum Offsets {
-    /// Text-mode offsets: flat list of byte positions where the placeholder
-    /// appears.
-    Text(Vec<usize>),
-    /// Binary-mode offsets: grouped by c-string. Each inner array contains
-    /// the prefix start positions followed by the NUL terminator position.
-    Binary(Vec<Vec<usize>>),
 }
 
 /// Byte offsets where the prefix placeholder appears in a file.

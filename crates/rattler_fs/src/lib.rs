@@ -1271,11 +1271,9 @@ mod tests {
                     no_link: false,
                     sha256: None,
                     size_in_bytes: None,
-                    executable: None,
                 })
                 .collect(),
             paths_version: 1,
-            has_executable: None,
         }
     }
 
