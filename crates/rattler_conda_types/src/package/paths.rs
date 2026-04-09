@@ -127,6 +127,7 @@ impl PathsJson {
                                 file_mode: entry.file_mode,
                                 placeholder: (*entry.prefix).to_owned(),
                                 offsets: None,
+                                shebang_length: None,
                             }),
                             no_link: no_link.contains(&path),
                             sha256: None,
@@ -195,10 +196,25 @@ pub struct PrefixPlaceholder {
     #[serde(rename = "prefix_placeholder")]
     pub placeholder: String,
 
-    /// The offsets on which the placeholders are found in the file
-    /// only present in version 2 of the paths.json file
+    /// Byte offsets within the file where the placeholder appears.
+    ///
+    /// Populated by newer conda-build / rattler-build versions to allow
+    /// offset-based prefix replacement without re-scanning the file.
+    /// `None` for older packages or packages whose publisher did not
+    /// populate the field — callers must scan the file themselves in
+    /// that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offsets: Option<Vec<usize>>,
+
+    /// The length in bytes of the original shebang line (up to and
+    /// including the trailing newline) for text files whose first line
+    /// is a shebang containing the placeholder prefix.
+    ///
+    /// Used to compute the exact post-replacement file size without
+    /// re-rendering the whole file. `None` for binary-mode placeholders,
+    /// files without a shebang, or older packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shebang_length: Option<usize>,
 }
 
 /// A single entry in the `paths.json` file.
@@ -499,6 +515,7 @@ mod test {
                         file_mode: FileMode::Binary,
                         placeholder: "/opt/conda".to_string(),
                         offsets: Some(vec![50, 150]),
+                        shebang_length: None,
                     }),
                     sha256: None,
                     size_in_bytes: Some(4096),
