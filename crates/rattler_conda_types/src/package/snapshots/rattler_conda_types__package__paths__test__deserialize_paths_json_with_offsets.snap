@@ -1,6 +1,6 @@
 ---
 source: crates/rattler_conda_types/src/package/paths.rs
-assertion_line: 452
+assertion_line: 482
 expression: paths_json
 ---
 paths:
@@ -9,9 +9,11 @@ paths:
     file_mode: binary
     prefix_placeholder: /opt/conda
     offsets:
-      - 100
-      - 200
-      - 300
+      - - 100
+        - 500
+      - - 200
+        - 300
+        - 800
     sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     size_in_bytes: 1024
   - _path: bin/symlink-example

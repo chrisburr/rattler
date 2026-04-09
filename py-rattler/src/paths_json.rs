@@ -388,17 +388,12 @@ impl From<PyPrefixPlaceholder> for PrefixPlaceholder {
 impl PyPrefixPlaceholder {
     /// Constructor
     #[new]
-    #[pyo3(signature = (file_mode, placeholder, offsets=None))]
-    pub fn new(
-        file_mode: PyFileMode,
-        placeholder: &str,
-        offsets: Option<Vec<usize>>,
-    ) -> PyResult<Self> {
+    pub fn new(file_mode: PyFileMode, placeholder: &str) -> PyResult<Self> {
         Ok(Self {
             inner: PrefixPlaceholder {
                 file_mode: file_mode.into(),
                 placeholder: placeholder.to_string(),
-                offsets,
+                offsets: None,
                 shebang_length: None,
             },
         })
