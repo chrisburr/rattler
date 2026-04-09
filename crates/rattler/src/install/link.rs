@@ -3,7 +3,7 @@
 use fs_err as fs;
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
-use rattler_conda_types::package::{FileMode, PathType, PathsEntry, PrefixPlaceholder};
+use rattler_conda_types::package::{FileMode, Offsets, PathType, PathsEntry, PrefixPlaceholder};
 use rattler_conda_types::Platform;
 use rattler_digest::Sha256;
 use rattler_digest::{HashingWriter, Sha256Hash};
@@ -656,10 +656,10 @@ pub fn copy_and_replace_placeholders_with_offsets(
     target_prefix: &str,
     target_platform: &Platform,
     file_mode: FileMode,
-    offsets: &[usize],
+    offsets: &Offsets,
 ) -> Result<(), std::io::Error> {
-    match file_mode {
-        FileMode::Text => {
+    match (file_mode, offsets) {
+        (FileMode::Text, Offsets::Text(offsets)) => {
             copy_and_replace_textual_placeholder_offsets(
                 source_bytes,
                 destination,
@@ -669,7 +669,7 @@ pub fn copy_and_replace_placeholders_with_offsets(
                 offsets,
             )?;
         }
-        FileMode::Binary => {
+        (FileMode::Binary, Offsets::Binary(groups)) => {
             // conda does not replace the prefix in the binary files on windows
             // DLLs are loaded quite differently anyways (there is no rpath, for example).
             if target_platform.is_windows() {
@@ -680,9 +680,15 @@ pub fn copy_and_replace_placeholders_with_offsets(
                     destination,
                     prefix_placeholder,
                     target_prefix,
-                    offsets,
+                    groups,
                 )?;
             }
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "offsets format does not match file mode",
+            ));
         }
     }
     Ok(())
@@ -966,13 +972,16 @@ pub fn copy_and_replace_cstring_placeholder(
 ///
 /// The length of the input will match the output.
 ///
-/// This function replaces binary c-style strings using pre-computed offsets for better performance.
+/// Offsets are grouped by c-string: each inner slice lists the prefix start
+/// positions followed by the position of the NUL terminator. For example,
+/// `[[5, 39], [22, 30, 39]]` means one c-string with the prefix at offset 5
+/// (NUL at 39), and another with prefixes at 22 and 30 (NUL at 39).
 pub fn copy_and_replace_cstring_placeholder_offsets(
     source_bytes: &[u8],
     mut destination: impl Write,
     prefix_placeholder: &str,
     target_prefix: &str,
-    offsets: &[usize],
+    groups: &[Vec<usize>],
 ) -> Result<(), std::io::Error> {
     let old_prefix = prefix_placeholder.as_bytes();
     let new_prefix = target_prefix.as_bytes();
@@ -984,44 +993,35 @@ pub fn copy_and_replace_cstring_placeholder_offsets(
         ));
     }
 
-    let mut last_pos = 0;
     let length_change = old_prefix.len() - new_prefix.len();
-    let mut unfinished_changes = 0;
+    let mut last_pos = 0;
 
-    for (index, &offset) in offsets.iter().enumerate() {
-        destination.write_all(&source_bytes[last_pos..offset])?;
+    for group in groups {
+        let (prefix_offsets, nul_pos) = group.split_at(group.len() - 1);
+        let nul_pos = nul_pos[0];
 
-        destination.write_all(new_prefix)?;
-
-        let after_prefix = offset + old_prefix.len();
-        let next_offset = offsets
-            .get(index + 1)
-            .copied()
-            .unwrap_or(source_bytes.len());
-
-        // Find the NUL terminator (or next offset boundary) after the replaced prefix.
-        let search_end = next_offset.min(source_bytes.len());
-        let end = memchr::memchr(b'\0', &source_bytes[after_prefix..search_end])
-            .map_or(search_end, |pos| after_prefix + pos);
-
-        destination.write_all(&source_bytes[after_prefix..end])?;
-
-        if end == next_offset {
-            unfinished_changes += 1;
-            last_pos = end;
-            continue;
-        };
-
-        let padding = (unfinished_changes + 1) * length_change;
-        if padding > 0 {
-            destination.write_all(&vec![0; padding])?;
-            unfinished_changes = 0;
+        for &offset in prefix_offsets {
+            // Write bytes between last position and this prefix
+            destination.write_all(&source_bytes[last_pos..offset])?;
+            // Write the new prefix
+            destination.write_all(new_prefix)?;
+            // Advance past old prefix in source
+            last_pos = offset + old_prefix.len();
         }
 
-        last_pos = end;
+        // Write remaining bytes from last prefix end to the NUL position
+        destination.write_all(&source_bytes[last_pos..nul_pos])?;
+
+        // Pad with zeros to preserve total length
+        let padding = prefix_offsets.len() * length_change;
+        if padding > 0 {
+            destination.write_all(&vec![0; padding])?;
+        }
+
+        last_pos = nul_pos;
     }
 
-    // Write any remaining bytes after the last replacement
+    // Write any remaining bytes after the last c-string
     if last_pos < source_bytes.len() {
         destination.write_all(&source_bytes[last_pos..])?;
     }
@@ -1562,14 +1562,14 @@ mod test {
     #[rstest]
     #[case(
         b"12345Hello, fabulous world!\x006789",
-        [12].to_vec(),
+        vec![vec![12, 28]],
         "fabulous",
         "cruel",
         b"12345Hello, cruel world!\x00\x00\x00\x006789"
     )]
     pub fn test_copy_and_replace_binary_placeholder_offsets(
         #[case] input: &[u8],
-        #[case] offsets: Vec<usize>,
+        #[case] groups: Vec<Vec<usize>>,
         #[case] prefix_placeholder: &str,
         #[case] target_prefix: &str,
         #[case] expected_output: &[u8],
@@ -1585,18 +1585,18 @@ mod test {
             &mut output,
             prefix_placeholder,
             target_prefix,
-            &offsets,
+            &groups,
         )
         .unwrap();
         assert_eq!(&output.into_inner(), expected_output);
     }
 
     #[rstest]
-    #[case(b"short\x00", [0].to_vec(), "short", "verylong")]
-    #[case(b"short1234\x00", [0].to_vec(), "short", "verylong")]
+    #[case(b"short\x00", vec![vec![0, 5]], "short", "verylong")]
+    #[case(b"short1234\x00", vec![vec![0, 9]], "short", "verylong")]
     pub fn test_shorter_binary_placeholder_offsets(
         #[case] input: &[u8],
-        #[case] offsets: Vec<usize>,
+        #[case] groups: Vec<Vec<usize>>,
         #[case] prefix_placeholder: &str,
         #[case] target_prefix: &str,
     ) {
@@ -1608,26 +1608,26 @@ mod test {
             &mut output,
             prefix_placeholder,
             target_prefix,
-            &offsets,
+            &groups,
         );
         assert!(result.is_err());
     }
 
     #[rstest]
     #[case(
-        b"beginrandomdataPATH=/placeholder/etc/share:/placeholder/bin/:\x00somemoretext", 
+        b"beginrandomdataPATH=/placeholder/etc/share:/placeholder/bin/:\x00somemoretext",
         b"beginrandomdataPATH=/target/etc/share:/target/bin/:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00somemoretext",
-        [20, 43].to_vec()
+        vec![vec![20, 43, 61]]
     )]
     #[case(
         b"beginrandomdataPATH=/placeholder/etc/share:/placeholder/bin/another/placeholder/:\x00somemoretext",
         b"beginrandomdataPATH=/target/etc/share:/target/bin/another/target/:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00somemoretext",
-        [20, 43, 67].to_vec(),
+        vec![vec![20, 43, 67, 81]],
     )]
     fn replace_binary_path_var_offsets(
         #[case] input: &[u8],
         #[case] result: &[u8],
-        #[case] offsets: Vec<usize>,
+        #[case] groups: Vec<Vec<usize>>,
     ) {
         let mut output = Cursor::new(Vec::new());
         super::copy_and_replace_cstring_placeholder_offsets(
@@ -1635,7 +1635,7 @@ mod test {
             &mut output,
             "/placeholder",
             "/target",
-            &offsets,
+            &groups,
         )
         .unwrap();
         let out = &output.into_inner();

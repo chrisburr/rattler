@@ -192,13 +192,19 @@ pub struct PrefixPlaceholder {
 
     /// Byte offsets within the file where the placeholder appears.
     ///
-    /// Populated by newer conda-build / rattler-build versions to allow
-    /// offset-based prefix replacement without re-scanning the file.
+    /// For text-mode files this is a flat list of byte positions:
+    /// `[offset1, offset2, ...]`
+    ///
+    /// For binary-mode files this is grouped by c-string. Each inner
+    /// array lists the prefix offsets followed by the position of the
+    /// NUL terminator:
+    /// `[[prefix1, nul], [prefix2, prefix3, nul], ...]`
+    ///
     /// `None` for older packages or packages whose publisher did not
     /// populate the field — callers must scan the file themselves in
     /// that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offsets: Option<Vec<usize>>,
+    pub offsets: Option<Offsets>,
 
     /// The length in bytes of the original shebang line (up to and
     /// including the trailing newline) for text files whose first line
@@ -250,6 +256,27 @@ pub struct PathsEntry {
     pub size_in_bytes: Option<u64>,
 }
 
+/// Byte offsets where the prefix placeholder appears in a file.
+///
+/// The format depends on the file mode:
+/// - **Text**: a flat list of byte positions (`[10, 45, 100]`).
+/// - **Binary**: grouped by c-string — each inner array lists the prefix
+///   offsets followed by the position of the NUL terminator
+///   (`[[5, 39], [22, 30, 39]]`).
+///
+/// The two representations are self-describing in JSON: a flat array of
+/// numbers vs. an array of arrays.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(untagged)]
+pub enum Offsets {
+    /// Text-mode offsets: flat list of byte positions where the placeholder
+    /// appears.
+    Text(Vec<usize>),
+    /// Binary-mode offsets: grouped by c-string. Each inner array contains
+    /// the prefix start positions followed by the NUL terminator position.
+    Binary(Vec<Vec<usize>>),
+}
+
 /// The file mode of the entry
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -286,7 +313,7 @@ fn is_no_link_default(value: &bool) -> bool {
 mod test {
     use crate::package::{PackageFile, PrefixPlaceholder};
 
-    use super::{FileMode, PathBuf, PathType, PathsEntry, PathsJson};
+    use super::{FileMode, Offsets, PathBuf, PathType, PathsEntry, PathsJson};
 
     #[test]
     pub fn roundtrip_paths_json() {
@@ -389,7 +416,7 @@ mod test {
                     "size_in_bytes": 1024,
                     "file_mode": "binary",
                     "prefix_placeholder": "/opt/conda",
-                    "offsets": [100, 200, 300]
+                    "offsets": [[100, 500], [200, 300, 800]]
                 },
                 {
                     "_path": "lib/library.so",
@@ -435,7 +462,10 @@ mod test {
         assert_eq!(paths_json.paths[0].size_in_bytes, Some(1024));
         let prefix = paths_json.paths[0].prefix_placeholder.as_ref().unwrap();
         assert_eq!(prefix.file_mode, FileMode::Binary);
-        assert_eq!(prefix.offsets, Some(vec![100, 200, 300]));
+        assert_eq!(
+            prefix.offsets,
+            Some(Offsets::Binary(vec![vec![100, 500], vec![200, 300, 800]]))
+        );
 
         // Second entry: no prefix placeholder
         assert!(paths_json.paths[1].prefix_placeholder.is_none());
@@ -443,7 +473,7 @@ mod test {
         // Third entry: text with offsets
         let text_prefix = paths_json.paths[2].prefix_placeholder.as_ref().unwrap();
         assert_eq!(text_prefix.file_mode, FileMode::Text);
-        assert_eq!(text_prefix.offsets, Some(vec![10, 45]));
+        assert_eq!(text_prefix.offsets, Some(Offsets::Text(vec![10, 45])));
 
         // Fourth entry: symlink, no offsets
         assert_eq!(paths_json.paths[3].path_type, PathType::SoftLink);
@@ -491,7 +521,7 @@ mod test {
                     prefix_placeholder: Some(PrefixPlaceholder {
                         file_mode: FileMode::Binary,
                         placeholder: "/opt/conda".to_string(),
-                        offsets: Some(vec![50, 150]),
+                        offsets: Some(Offsets::Binary(vec![vec![50, 200], vec![150, 200]])),
                         shebang_length: None,
                     }),
                     sha256: None,
@@ -524,7 +554,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .offsets,
-            Some(vec![50, 150])
+            Some(Offsets::Binary(vec![vec![50, 200], vec![150, 200]]))
         );
     }
 
