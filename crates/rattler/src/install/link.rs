@@ -178,6 +178,7 @@ pub fn link_file(
         file_mode,
         placeholder,
         offsets,
+        ..
     }) = path_json_entry.prefix_placeholder.as_ref()
     {
         // Memory map the source file. This provides us with easy access to a continuous stream of
@@ -1127,13 +1128,17 @@ mod test {
             prefix_placeholder: Some(PrefixPlaceholder {
                 file_mode: FileMode::Text,
                 placeholder: "/old/placeholder/path".to_string(),
+                offsets: None,
+                shebang_length: None,
             }),
             sha256: None,
             size_in_bytes: None,
+            executable: None,
         };
 
         let result = super::link_file(
             &entry,
+            false,
             PathBuf::from("config.py"),
             &package_dir,
             &target_dir,
@@ -1190,10 +1195,12 @@ mod test {
             prefix_placeholder: None,
             sha256: None,
             size_in_bytes: None,
+            executable: None,
         };
 
         let result = super::link_file(
             &entry,
+            false,
             PathBuf::from("data.txt"),
             &package_dir,
             &target_dir,
