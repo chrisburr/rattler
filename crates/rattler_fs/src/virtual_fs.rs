@@ -2,7 +2,7 @@ use libc::{EIO, ENOENT, ENOTDIR};
 use memmap2::Mmap;
 #[cfg(target_os = "macos")]
 use rattler::install::link::copy_and_replace_placeholders_with_offsets;
-use rattler_conda_types::package::{FileMode, PathType};
+use rattler_conda_types::package::{FileMode, Offsets, PathType};
 use rattler_conda_types::Platform;
 use std::{
     collections::HashMap,
@@ -29,7 +29,7 @@ pub struct VirtualFS {
     /// Pre-computed replacement offsets for files with prefix placeholders.
     /// Keyed by inode. Populated eagerly at construction from paths.json
     /// offsets or by scanning the source file.
-    offset_cache: HashMap<u64, Vec<usize>>,
+    offset_cache: HashMap<u64, Offsets>,
     /// Cache for fully materialized + codesigned binary content (macOS only).
     /// Keyed by inode. Only populated for binary-mode prefix files that need
     /// ad-hoc re-signing, since codesign requires the full file.
@@ -78,7 +78,14 @@ impl VirtualFS {
                 o.clone()
             } else {
                 match fs::read(&cache_path) {
-                    Ok(source) => crate::prefix_replacement::collect_offsets(&source, old_prefix),
+                    Ok(source) => match placeholder.file_mode {
+                        FileMode::Text => Offsets::Text(
+                            crate::prefix_replacement::collect_offsets(&source, old_prefix),
+                        ),
+                        FileMode::Binary => Offsets::Binary(
+                            crate::prefix_replacement::collect_binary_offsets(&source, old_prefix),
+                        ),
+                    },
                     Err(e) => {
                         tracing::warn!(
                             "failed to read {} for offset computation: {}",
@@ -92,12 +99,13 @@ impl VirtualFS {
 
             // For text-mode files, compute post-replacement size from arithmetic:
             // each replacement changes length by (new_prefix - old_prefix) bytes
-            if placeholder.file_mode == FileMode::Text {
+            if let Offsets::Text(ref text_offsets) = offsets {
                 if let Ok(source_meta) = fs::symlink_metadata(&cache_path) {
                     let delta =
                         target_prefix.len() as isize - placeholder.placeholder.len() as isize;
-                    let new_size =
-                        (source_meta.len() as isize + delta * offsets.len() as isize).max(0) as u64;
+                    let new_size = (source_meta.len() as isize
+                        + delta * text_offsets.len() as isize)
+                        .max(0) as u64;
                     metadata[i].as_file_mut().unwrap().computed_size = Some(new_size);
                 }
             }
@@ -300,14 +308,18 @@ impl VirtualFS {
         let new_prefix_str = self.mount_point.to_string_lossy();
         let new_prefix = new_prefix_str.as_bytes();
 
-        let empty_offsets = Vec::new();
-        let offsets = self.offset_cache.get(&ino).unwrap_or(&empty_offsets);
-
         let start = offset as usize;
         let end = start + size as usize;
 
-        match placeholder.file_mode {
-            FileMode::Binary => {
+        let Some(offsets) = self.offset_cache.get(&ino) else {
+            // No offsets — serve source bytes directly
+            let s = start.min(mmap.len());
+            let e = (s + size as usize).min(mmap.len());
+            return Ok(mmap[s..e].to_vec());
+        };
+
+        match offsets {
+            Offsets::Binary(groups) => {
                 // macOS binaries need codesign after prefix replacement.
                 // Codesign rehashes every page so it can't be done as a ranged
                 // operation. Materialize + resign once, cache for subsequent reads.
@@ -354,11 +366,16 @@ impl VirtualFS {
                 }
 
                 Ok(crate::prefix_replacement::binary_ranged_read(
-                    &mmap, old_prefix, new_prefix, offsets, start, end,
+                    &mmap, old_prefix, new_prefix, groups, start, end,
                 ))
             }
-            FileMode::Text => Ok(crate::prefix_replacement::text_ranged_read(
-                &mmap, old_prefix, new_prefix, offsets, start, end,
+            Offsets::Text(text_offsets) => Ok(crate::prefix_replacement::text_ranged_read(
+                &mmap,
+                old_prefix,
+                new_prefix,
+                text_offsets,
+                start,
+                end,
             )),
         }
     }

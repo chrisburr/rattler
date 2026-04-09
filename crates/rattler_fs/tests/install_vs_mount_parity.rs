@@ -13,13 +13,9 @@
 use std::io::Cursor;
 
 use rattler_conda_types::{package::FileMode, Platform};
-use rattler_fs::prefix_replacement::{binary_ranged_read, text_ranged_read};
-
-/// Compute placeholder offsets in `source` by scanning for `placeholder` bytes.
-fn placeholder_offsets(source: &[u8], placeholder: &str) -> Vec<usize> {
-    use memchr::memmem;
-    memmem::find_iter(source, placeholder.as_bytes()).collect()
-}
+use rattler_fs::prefix_replacement::{
+    binary_ranged_read, collect_binary_offsets, collect_offsets, text_ranged_read,
+};
 
 /// Run install-time prefix replacement and return the resulting bytes.
 fn install_replace(
@@ -49,27 +45,25 @@ fn mount_replace_full(
     target_prefix: &str,
     file_mode: FileMode,
 ) -> Vec<u8> {
-    let offsets = placeholder_offsets(source, placeholder);
-    // Pick an end position large enough to cover any possible transformed
-    // length (text mode can grow if target_prefix is longer than placeholder).
-    let huge = source.len() + target_prefix.len() * (offsets.len() + 1) + 1024;
+    let placeholder_bytes = placeholder.as_bytes();
+    let target_bytes = target_prefix.as_bytes();
     match file_mode {
-        FileMode::Text => text_ranged_read(
-            source,
-            placeholder.as_bytes(),
-            target_prefix.as_bytes(),
-            &offsets,
-            0,
-            huge,
-        ),
-        FileMode::Binary => binary_ranged_read(
-            source,
-            placeholder.as_bytes(),
-            target_prefix.as_bytes(),
-            &offsets,
-            0,
-            huge,
-        ),
+        FileMode::Text => {
+            let offsets = collect_offsets(source, placeholder_bytes);
+            let huge = source.len() + target_prefix.len() * (offsets.len() + 1) + 1024;
+            text_ranged_read(source, placeholder_bytes, target_bytes, &offsets, 0, huge)
+        }
+        FileMode::Binary => {
+            let groups = collect_binary_offsets(source, placeholder_bytes);
+            binary_ranged_read(
+                source,
+                placeholder_bytes,
+                target_bytes,
+                &groups,
+                0,
+                source.len(),
+            )
+        }
     }
 }
 
@@ -250,7 +244,7 @@ fn ranged_read_text_matches_install_slice() {
         FileMode::Text,
         Platform::Linux64,
     );
-    let offsets = placeholder_offsets(source.as_bytes(), placeholder);
+    let offsets = collect_offsets(source.as_bytes(), placeholder.as_bytes());
 
     // Sample several arbitrary byte ranges and confirm they match the
     // corresponding window of the full install output.
@@ -285,7 +279,7 @@ fn ranged_read_binary_matches_install_slice() {
         FileMode::Binary,
         Platform::Linux64,
     );
-    let offsets = placeholder_offsets(&source, placeholder);
+    let groups = collect_binary_offsets(&source, placeholder.as_bytes());
 
     let cases = [(0usize, 4), (2, 16), (0, install_bytes.len()), (10, 20)];
     for (start, end) in cases {
@@ -293,7 +287,7 @@ fn ranged_read_binary_matches_install_slice() {
             &source,
             placeholder.as_bytes(),
             target.as_bytes(),
-            &offsets,
+            &groups,
             start,
             end,
         );

@@ -322,6 +322,27 @@ pub enum Offsets {
     Binary(Vec<Vec<usize>>),
 }
 
+/// Byte offsets where the prefix placeholder appears in a file.
+///
+/// The format depends on the file mode:
+/// - **Text**: a flat list of byte positions (`[10, 45, 100]`).
+/// - **Binary**: grouped by c-string — each inner array lists the prefix
+///   offsets followed by the position of the NUL terminator
+///   (`[[5, 39], [22, 30, 39]]`).
+///
+/// The two representations are self-describing in JSON: a flat array of
+/// numbers vs. an array of arrays.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(untagged)]
+pub enum Offsets {
+    /// Text-mode offsets: flat list of byte positions where the placeholder
+    /// appears.
+    Text(Vec<usize>),
+    /// Binary-mode offsets: grouped by c-string. Each inner array contains
+    /// the prefix start positions followed by the NUL terminator position.
+    Binary(Vec<Vec<usize>>),
+}
+
 /// The file mode of the entry
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "lowercase")]

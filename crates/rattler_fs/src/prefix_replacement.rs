@@ -71,9 +71,9 @@ pub fn text_ranged_read(
 /// Read a range from a binary file with prefix replacements applied.
 ///
 /// Binary-mode replacement swaps `old_prefix` → `new_prefix` and pads with
-/// null bytes to maintain the same total length. Multiple consecutive
-/// replacements that share a c-string (no null terminator between them)
-/// accumulate padding which is emitted at the next null byte.
+/// null bytes to maintain the same total length. Offsets are grouped by
+/// c-string: each inner slice lists prefix start positions followed by the
+/// NUL terminator position.
 ///
 /// Output length always equals source length.
 ///
@@ -82,7 +82,7 @@ pub fn binary_ranged_read(
     source: &[u8],
     old_prefix: &[u8],
     new_prefix: &[u8],
-    offsets: &[usize],
+    groups: &[Vec<usize>],
     start: usize,
     end: usize,
 ) -> Vec<u8> {
@@ -101,122 +101,177 @@ pub fn binary_ranged_read(
     let capacity = actual_end - actual_start;
     let mut buffer = Vec::with_capacity(capacity);
 
-    // Find the first offset at or after `start` via binary search.
-    let first_offset_idx = offsets.partition_point(|&o| o < actual_start);
+    // Build a virtual stream of the fully-replaced file, emitting only
+    // the bytes that fall within [actual_start, actual_end).
+    let mut out_pos: usize = 0; // current position in the output stream
+    let mut src_pos: usize = 0; // current position in the source
 
-    // Count "unfinished replacements" — replacements before `start` whose
-    // null-padding hasn't been emitted yet (no null byte between the
-    // replacement and `start`).
-    let unfinished = count_unfinished_before(source, offsets, first_offset_idx, actual_start);
+    for group in groups {
+        let (prefix_offsets, nul_slice) = group.split_at(group.len() - 1);
+        let nul_pos = nul_slice[0];
 
-    // Compute where in the source to start reading, accounting for
-    // accumulated padding from unfinished replacements that shifts our
-    // position forward.
-    let src_start = actual_start + unfinished * length_change;
+        for &offset in prefix_offsets {
+            // Emit source bytes from src_pos to this prefix
+            emit_range(
+                source,
+                src_pos,
+                offset,
+                &mut out_pos,
+                actual_start,
+                actual_end,
+                &mut buffer,
+            );
+            src_pos = offset;
 
-    let mut src_pos = src_start;
-    let mut offset_idx = first_offset_idx;
-    let mut pending_padding = unfinished * length_change;
-
-    while src_pos < source.len() && buffer.len() < capacity {
-        if offset_idx < offsets.len() && src_pos == offsets[offset_idx] {
-            // At a replacement site
-            offset_idx += 1;
-
-            // Emit the new prefix
-            for &b in new_prefix {
-                if buffer.len() >= capacity {
-                    return buffer;
-                }
-                buffer.push(b);
-            }
-
-            // Skip the old prefix in source
+            // Emit new prefix
+            emit_bytes(
+                new_prefix,
+                &mut out_pos,
+                actual_start,
+                actual_end,
+                &mut buffer,
+            );
             src_pos += old_prefix.len();
-            pending_padding += length_change;
+        }
 
-            // Determine the boundary for this c-string: next offset or end
-            let boundary = offsets.get(offset_idx).copied().unwrap_or(source.len());
+        // Emit source bytes from last prefix end to NUL position
+        emit_range(
+            source,
+            src_pos,
+            nul_pos,
+            &mut out_pos,
+            actual_start,
+            actual_end,
+            &mut buffer,
+        );
+        src_pos = nul_pos;
 
-            // Copy bytes after the old prefix until null byte or next offset
-            while src_pos < source.len()
-                && src_pos < boundary
-                && source[src_pos] != 0
-                && buffer.len() < capacity
-            {
-                buffer.push(source[src_pos]);
-                src_pos += 1;
-            }
+        // Emit padding zeros
+        let padding = prefix_offsets.len() * length_change;
+        emit_zeros(padding, &mut out_pos, actual_start, actual_end, &mut buffer);
 
-            // If we hit a null byte, emit the accumulated padding
-            if src_pos < source.len() && source[src_pos] == 0 {
-                // Emit the original null byte position's worth of padding
-                for _ in 0..pending_padding {
-                    if buffer.len() >= capacity {
-                        return buffer;
-                    }
-                    buffer.push(0);
-                }
-                pending_padding = 0;
-            }
-        } else if source[src_pos] == 0 && pending_padding > 0 {
-            // Null byte with accumulated padding from previous replacements
-            buffer.push(0);
-            src_pos += 1;
-            for _ in 0..pending_padding {
-                if buffer.len() >= capacity {
-                    return buffer;
-                }
-                buffer.push(0);
-            }
-            pending_padding = 0;
-        } else {
-            // Regular byte
-            buffer.push(source[src_pos]);
-            src_pos += 1;
+        if buffer.len() >= capacity {
+            break;
         }
     }
 
-    // Emit any remaining padding at EOF (e.g. file ends without a null byte
-    // after replacements)
-    while pending_padding > 0 && buffer.len() < capacity {
-        buffer.push(0);
-        pending_padding -= 1;
+    // Emit remaining source bytes after the last group
+    if src_pos < source.len() && buffer.len() < capacity {
+        emit_range(
+            source,
+            src_pos,
+            source.len(),
+            &mut out_pos,
+            actual_start,
+            actual_end,
+            &mut buffer,
+        );
     }
 
     buffer
 }
 
-/// Count replacements before `first_offset_idx` that haven't had their
-/// null-padding emitted yet (i.e. no null byte between the last replacement
-/// before `start` and `start` itself).
-fn count_unfinished_before(
+/// Emit bytes from `source[src_start..src_end]` into buffer, but only those
+/// that fall within the output window `[win_start, win_end)`.
+#[inline]
+fn emit_range(
     source: &[u8],
-    offsets: &[usize],
-    first_offset_idx: usize,
-    start: usize,
-) -> usize {
-    if first_offset_idx == 0 {
-        return 0;
+    src_start: usize,
+    src_end: usize,
+    out_pos: &mut usize,
+    win_start: usize,
+    win_end: usize,
+    buffer: &mut Vec<u8>,
+) {
+    for &b in &source[src_start..src_end] {
+        if *out_pos >= win_start && *out_pos < win_end {
+            buffer.push(b);
+        }
+        *out_pos += 1;
+        if *out_pos >= win_end {
+            return;
+        }
     }
-
-    // Find the last null byte before `start` in the source
-    let region = &source[..start.min(source.len())];
-    let last_null = memchr::memrchr(0, region);
-
-    // Count offsets that are after the last null byte (or from the start if no null)
-    let threshold = last_null.map_or(0, |pos| pos + 1);
-    offsets[..first_offset_idx]
-        .iter()
-        .rev()
-        .take_while(|&&o| o >= threshold)
-        .count()
 }
 
-/// Compute replacement offsets by scanning the source for the placeholder.
+/// Emit a slice of bytes into buffer within the output window.
+#[inline]
+fn emit_bytes(
+    data: &[u8],
+    out_pos: &mut usize,
+    win_start: usize,
+    win_end: usize,
+    buffer: &mut Vec<u8>,
+) {
+    for &b in data {
+        if *out_pos >= win_start && *out_pos < win_end {
+            buffer.push(b);
+        }
+        *out_pos += 1;
+        if *out_pos >= win_end {
+            return;
+        }
+    }
+}
+
+/// Emit `count` zero bytes into buffer within the output window.
+#[inline]
+fn emit_zeros(
+    count: usize,
+    out_pos: &mut usize,
+    win_start: usize,
+    win_end: usize,
+    buffer: &mut Vec<u8>,
+) {
+    for _ in 0..count {
+        if *out_pos >= win_start && *out_pos < win_end {
+            buffer.push(0);
+        }
+        *out_pos += 1;
+        if *out_pos >= win_end {
+            return;
+        }
+    }
+}
+
+/// Compute text-mode replacement offsets by scanning the source for the placeholder.
 /// Used when paths.json doesn't provide offsets (legacy v1 format).
 pub fn collect_offsets(source: &[u8], placeholder: &[u8]) -> Vec<usize> {
     memmem::find_iter(source, placeholder).collect()
+}
+
+/// Compute binary-mode replacement offsets grouped by c-string.
+/// Each inner Vec lists the prefix start positions followed by the NUL
+/// terminator position: `[prefix1, prefix2, nul_pos]`.
+/// Used when paths.json doesn't provide offsets (legacy v1 format).
+pub fn collect_binary_offsets(source: &[u8], placeholder: &[u8]) -> Vec<Vec<usize>> {
+    let flat: Vec<usize> = memmem::find_iter(source, placeholder).collect();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current_group: Vec<usize> = Vec::new();
+
+    for offset in flat {
+        // Check if there's a NUL between the previous offset's end and this one
+        if let Some(&prev) = current_group.last() {
+            let search_start = prev + placeholder.len();
+            if let Some(nul_pos) = memchr::memchr(b'\0', &source[search_start..offset]) {
+                // NUL found — close previous group
+                current_group.push(search_start + nul_pos);
+                groups.push(std::mem::take(&mut current_group));
+            }
+        }
+        current_group.push(offset);
+    }
+
+    // Close the last group — find the NUL after the last prefix
+    if !current_group.is_empty() {
+        let last_end = current_group.last().unwrap() + placeholder.len();
+        let nul_pos = memchr::memchr(b'\0', &source[last_end..])
+            .map_or(source.len(), |p| last_end + p);
+        current_group.push(nul_pos);
+        groups.push(current_group);
+    }
+
+    groups
 }
 
 #[cfg(test)]
@@ -249,8 +304,8 @@ mod tests {
         start: usize,
         end: usize,
     ) {
-        let offsets = collect_offsets(source, placeholder);
-        let result = binary_ranged_read(source, placeholder, prefix, &offsets, start, end);
+        let groups = collect_binary_offsets(source, placeholder);
+        let result = binary_ranged_read(source, placeholder, prefix, &groups, start, end);
         assert_eq!(
             result, expected,
             "binary replacement [{start}..{end}] of {source:?}: expected {expected:?}, got {result:?}"
@@ -503,5 +558,32 @@ mod tests {
     #[test]
     fn collect_offsets_consecutive() {
         assert_eq!(collect_offsets(b"ABCDABCD", b"ABCD"), vec![0, 4]);
+    }
+
+    #[test]
+    fn collect_binary_offsets_single() {
+        // One prefix in one c-string
+        assert_eq!(
+            collect_binary_offsets(b"hello/PFX/bin\x00tail", b"/PFX"),
+            vec![vec![5, 13]]
+        );
+    }
+
+    #[test]
+    fn collect_binary_offsets_multi_in_one_cstring() {
+        // Two prefixes sharing one c-string (PATH-style)
+        assert_eq!(
+            collect_binary_offsets(b"PATH=/PFX/a:/PFX/b\x00tail", b"/PFX"),
+            vec![vec![5, 12, 18]]
+        );
+    }
+
+    #[test]
+    fn collect_binary_offsets_separate_cstrings() {
+        // Two prefixes in separate c-strings
+        assert_eq!(
+            collect_binary_offsets(b"/PFX/a\x00/PFX/b\x00", b"/PFX"),
+            vec![vec![0, 6], vec![7, 13]]
+        );
     }
 }
