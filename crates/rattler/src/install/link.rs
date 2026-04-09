@@ -998,17 +998,18 @@ pub fn copy_and_replace_cstring_placeholder_offsets(
 
         destination.write_all(new_prefix)?;
 
-        let mut end = offset + old_prefix.len();
+        let after_prefix = offset + old_prefix.len();
         let next_offset = offsets
             .get(index + 1)
             .copied()
             .unwrap_or(source_bytes.len());
 
-        while end < source_bytes.len() && source_bytes[end] != b'\0' && end < next_offset {
-            end += 1;
-        }
+        // Find the NUL terminator (or next offset boundary) after the replaced prefix.
+        let search_end = next_offset.min(source_bytes.len());
+        let end = memchr::memchr(b'\0', &source_bytes[after_prefix..search_end])
+            .map_or(search_end, |pos| after_prefix + pos);
 
-        destination.write_all(&source_bytes[(offset + old_prefix.len())..end])?;
+        destination.write_all(&source_bytes[after_prefix..end])?;
 
         if end == next_offset {
             unfinished_changes += 1;
