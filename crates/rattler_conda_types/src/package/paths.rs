@@ -17,10 +17,6 @@ use std::path::{Path, PathBuf};
 #[sorted]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathsJson {
-    /// If the file contains the executable field implemented
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub has_executable: Option<bool>,
-
     /// All entries included in the package.
     #[serde(serialize_with = "serialize_sorted_paths")]
     pub paths: Vec<PathsEntry>,
@@ -112,7 +108,6 @@ impl PathsJson {
 
         // Iterate over all files and create entries
         Ok(Self {
-            has_executable: None,
             paths: files
                 .files
                 .into_iter()
@@ -133,7 +128,6 @@ impl PathsJson {
                             sha256: None,
                             size_in_bytes: None,
                             relative_path: path,
-                            executable: None,
                         }),
                         Err(e) => Err(e),
                     }
@@ -254,11 +248,6 @@ pub struct PathsEntry {
     /// This entry is present in version 1 and up of the paths.json file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_in_bytes: Option<u64>,
-
-    /// When a file is executable this will be true
-    /// This entry is only present in newer versions of the paths.json file
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executable: Option<bool>,
 }
 
 /// The file mode of the entry
@@ -370,7 +359,6 @@ mod test {
                 no_link: false,
                 sha256: None,
                 size_in_bytes: Some(0),
-                executable: None,
             });
         }
 
@@ -379,19 +367,18 @@ mod test {
         paths.shuffle(&mut rng);
 
         insta::assert_yaml_snapshot!(PathsJson {
-            has_executable: None,
             paths,
             paths_version: 1
         });
     }
 
     #[test]
-    pub fn test_deserialize_paths_json_executable() {
+    pub fn test_deserialize_paths_json_with_offsets() {
         let package_dir = tempfile::tempdir().unwrap();
         let info_dir = package_dir.path().join("info");
         std::fs::create_dir_all(&info_dir).unwrap();
 
-        // Create a mock paths.json file
+        // Create a mock paths.json with offset fields
         let paths_json = r#"{
             "paths": [
                 {
@@ -400,7 +387,6 @@ mod test {
                     "path_type": "hardlink",
                     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                     "size_in_bytes": 1024,
-                    "executable": true,
                     "file_mode": "binary",
                     "prefix_placeholder": "/opt/conda",
                     "offsets": [100, 200, 300]
@@ -425,11 +411,9 @@ mod test {
                 {
                     "_path": "bin/symlink-example",
                     "no_link": false,
-                    "path_type": "softlink",
-                    "executable": true
+                    "path_type": "softlink"
                 }
             ],
-            "has_executable": true,
             "paths_version": 1
             }"#;
 
@@ -440,25 +424,20 @@ mod test {
         let paths_json =
             PathsJson::from_package_directory_with_deprecated_fallback(package_dir.path()).unwrap();
 
-        // Verify it's version
         assert_eq!(paths_json.paths_version, 1);
         assert_eq!(paths_json.paths.len(), 4);
 
-        assert_eq!(paths_json.has_executable, Some(true));
-
-        // First entry: binary with offsets and executable
+        // First entry: binary with offsets
         assert_eq!(
             paths_json.paths[0].relative_path,
             PathBuf::from("bin/example")
         );
-        assert_eq!(paths_json.paths[0].executable, Some(true));
         assert_eq!(paths_json.paths[0].size_in_bytes, Some(1024));
         let prefix = paths_json.paths[0].prefix_placeholder.as_ref().unwrap();
         assert_eq!(prefix.file_mode, FileMode::Binary);
         assert_eq!(prefix.offsets, Some(vec![100, 200, 300]));
 
-        // Second entry: no prefix, not executable
-        assert_eq!(paths_json.paths[1].executable, None);
+        // Second entry: no prefix placeholder
         assert!(paths_json.paths[1].prefix_placeholder.is_none());
 
         // Third entry: text with offsets
@@ -466,9 +445,9 @@ mod test {
         assert_eq!(text_prefix.file_mode, FileMode::Text);
         assert_eq!(text_prefix.offsets, Some(vec![10, 45]));
 
-        // Fourth entry: symlink with executable
+        // Fourth entry: symlink, no offsets
         assert_eq!(paths_json.paths[3].path_type, PathType::SoftLink);
-        assert_eq!(paths_json.paths[3].executable, Some(true));
+        assert!(paths_json.paths[3].prefix_placeholder.is_none());
 
         insta::assert_yaml_snapshot!(paths_json);
     }
@@ -495,7 +474,6 @@ mod test {
         let paths_json = PathsJson::from_package_directory(package_dir.path()).unwrap();
 
         assert_eq!(paths_json.paths_version, 1);
-        assert_eq!(paths_json.paths[0].executable, None);
         assert_eq!(paths_json.paths[0].sha256, None);
         assert_eq!(paths_json.paths[0].size_in_bytes, None);
         assert!(paths_json.paths[0].prefix_placeholder.is_none());
@@ -503,9 +481,8 @@ mod test {
 
     #[test]
     pub fn test_serialization_roundtrip() {
-        // Create a PathsJson with executable and offset fields programmatically
+        // Create a PathsJson with offset fields programmatically
         let original = PathsJson {
-            has_executable: Some(true),
             paths: vec![
                 PathsEntry {
                     relative_path: PathBuf::from("bin/tool"),
@@ -519,7 +496,6 @@ mod test {
                     }),
                     sha256: None,
                     size_in_bytes: Some(4096),
-                    executable: Some(true),
                 },
                 PathsEntry {
                     relative_path: PathBuf::from("lib/module.py"),
@@ -528,7 +504,6 @@ mod test {
                     prefix_placeholder: None,
                     sha256: None,
                     size_in_bytes: Some(512),
-                    executable: None,
                 },
             ],
             paths_version: 1,
@@ -543,7 +518,6 @@ mod test {
         // Verify roundtrip
         assert_eq!(original, deserialized);
         assert_eq!(deserialized.paths_version, 1);
-        assert_eq!(deserialized.paths[0].executable, Some(true));
         assert_eq!(
             deserialized.paths[0]
                 .prefix_placeholder
@@ -579,7 +553,10 @@ mod test {
         assert_eq!(paths_json.paths_version, 1);
         assert_eq!(paths_json.paths.len(), 2);
 
-        // v1 shouldn't have v2 fields
-        assert!(paths_json.paths.iter().all(|p| p.executable.is_none()));
+        // Deprecated format shouldn't have offsets
+        assert!(paths_json.paths.iter().all(|p| p
+            .prefix_placeholder
+            .as_ref()
+            .is_none_or(|pp| pp.offsets.is_none())));
     }
 }

@@ -199,7 +199,7 @@ impl From<PyPathsEntry> for PathsEntry {
 impl PyPathsEntry {
     /// Constructor
     #[new]
-    #[pyo3(signature = (relative_path, no_link, path_type, prefix_placeholder=None, sha256=None, size_in_bytes=None, executable=None))]
+    #[pyo3(signature = (relative_path, no_link, path_type, prefix_placeholder=None, sha256=None, size_in_bytes=None))]
     pub fn new(
         relative_path: PathBuf,
         no_link: bool,
@@ -207,7 +207,6 @@ impl PyPathsEntry {
         prefix_placeholder: Option<PyPrefixPlaceholder>,
         sha256: Option<Bound<'_, PyBytes>>,
         size_in_bytes: Option<u64>,
-        executable: Option<bool>,
     ) -> PyResult<Self> {
         let sha256 = sha256.map(sha256_from_pybytes).transpose()?;
         Ok(Self {
@@ -218,7 +217,6 @@ impl PyPathsEntry {
                 prefix_placeholder: prefix_placeholder.map(Into::into),
                 sha256,
                 size_in_bytes,
-                executable,
             },
         })
     }
