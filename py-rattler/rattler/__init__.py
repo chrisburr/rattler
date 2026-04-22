@@ -34,6 +34,7 @@ from rattler.prefix import PrefixRecord, PrefixPaths, PrefixPathsEntry, PrefixPa
 from rattler.platform import Platform
 from rattler.utils.rattler_version import get_rattler_version as _get_rattler_version
 from rattler.install import install, InstallerReporter
+from rattler.package_cache import PackageCache
 from rattler.index import index
 from rattler.lock import (
     LockFile,
@@ -94,6 +95,7 @@ __all__ = [
     "Platform",
     "install",
     "InstallerReporter",
+    "PackageCache",
     "index",
     "AboutJson",
     "RunExportsJson",
