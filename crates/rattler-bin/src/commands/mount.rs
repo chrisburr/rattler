@@ -11,7 +11,7 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use rattler_cache::{default_cache_dir, package_cache::PackageCache};
 use rattler_conda_types::Platform;
-use rattler_fs::{build_and_mount, compute_env_hash, MountConfig, Transport};
+use rattler_fs::{build_and_mount, MountConfig, Transport};
 use rattler_lock::{LockFile, DEFAULT_ENVIRONMENT_NAME};
 
 /// Mount a lockfile as a virtual conda environment.
@@ -75,8 +75,12 @@ fn anyhow_to_miette(e: anyhow::Error) -> miette::Report {
 pub async fn mount(opt: Opt) -> Result<()> {
     let lockfile = LockFile::from_path(&opt.lock_file).into_diagnostic()?;
     let platform = Platform::current();
-    let env_hash =
-        compute_env_hash(&lockfile, &opt.environment, platform).map_err(anyhow_to_miette)?;
+    let environment = lockfile
+        .environment(&opt.environment)
+        .ok_or_else(|| miette::miette!("environment '{}' not found in lock file", opt.environment))?;
+    let env_hash = environment
+        .content_hash(platform)
+        .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{}'", opt.environment))?;
 
     let cache_dir = default_cache_dir().map_err(anyhow_to_miette)?.join("pkgs");
     let package_cache = PackageCache::new(cache_dir);

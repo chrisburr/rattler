@@ -8,14 +8,16 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use rattler_fs::{MountConfig, Transport, build_and_mount, compute_env_hash};
+//! use rattler_fs::{MountConfig, Transport, build_and_mount};
 //! use rattler_cache::{default_cache_dir, package_cache::PackageCache};
 //! use rattler_conda_types::Platform;
 //! use rattler_lock::LockFile;
 //! # async fn example() -> anyhow::Result<()> {
 //! let lockfile = LockFile::from_path("pixi.lock".as_ref())?;
 //! let platform = Platform::current();
-//! let env_hash = compute_env_hash(&lockfile, "default", platform)?;
+//! let environment = lockfile.environment("default").unwrap();
+//! let lock_platform = lockfile.platform(&platform.to_string()).unwrap();
+//! let env_hash = environment.content_hash(lock_platform).unwrap();
 //! let cache = PackageCache::new(default_cache_dir()?.join("pkgs"));
 //!
 //! let config = MountConfig::new_read_only(
@@ -449,7 +451,7 @@ pub struct MountConfig {
 
     /// Identity hash of the resolved environment, used to detect when the
     /// environment has changed and the overlay needs to be reset. Compute
-    /// with [`compute_env_hash`].
+    /// with [`rattler_lock::Environment::content_hash`].
     pub env_hash: String,
 
     /// Allow other users to access the mount. Only applies to FUSE; requires
@@ -724,6 +726,26 @@ pub async fn build_metadata_tree(
         tracing::debug!("parsed {} metadata entries", env_paths.len());
     }
 
+    // Inject conda-meta/rattler-fs_env virtual file with the environment
+    // content hash. This allows consumers (e.g. pixi) to read the hash from
+    // the mounted filesystem for cache validation, even on read-only mounts.
+    if let Some(content_hash) = environment.content_hash(lock_platform) {
+        let conda_meta_dir = PathBuf::from("./conda-meta");
+        let conda_meta_idx =
+            ensure_directory(conda_meta_dir, 0, &mut env_paths, &mut directory_indices);
+        let file_idx = env_paths.len();
+        env_paths.push(MetadataNode::new_virtual_file(
+            "rattler-fs_env".into(),
+            conda_meta_idx,
+            content_hash.into_bytes(),
+        ));
+        env_paths[conda_meta_idx]
+            .as_directory_mut()
+            .expect("conda-meta is a directory")
+            .children
+            .push(file_idx);
+    }
+
     Ok(MetadataTree(env_paths))
 }
 
@@ -838,113 +860,6 @@ pub async fn build_and_mount(
     mount(metadata, config).await
 }
 
-/// Schema version for [`compute_env_hash`].  Bump when the canonical form
-/// changes so overlays are intentionally invalidated rather than silently
-/// drifting.  The golden test `test_env_hash_stability` will fail when this
-/// is bumped, reminding the author to update the expected hash.
-pub const ENV_HASH_SCHEMA_VERSION: u32 = 2;
-
-/// Compute an environment identity hash scoped to a single `(env, platform)`.
-///
-/// Hashes only the resolved package list for `environment_name` on `platform`,
-/// **not** the entire lock-file bytes. Two consequences:
-///
-/// 1. Editing environment B does not invalidate overlays for environment A.
-///    The pixi sidecar can keep one overlay per `(lockfile, env, platform)`
-///    tuple without thrashing on unrelated changes.
-/// 2. Reformatting the lock file or reordering its packages does not change
-///    the hash, because each package is built into an explicit canonical
-///    string (not serde-derived) and the strings are sorted before hashing.
-///
-/// The canonical form uses `\0`-separated fields per package to prevent
-/// concatenation collisions.  Only fields that identify the package content
-/// are included (name, version, build/subdir for conda, url for pypi, and
-/// the content sha256 when available).
-pub fn compute_env_hash(
-    lockfile: &LockFile,
-    environment_name: &str,
-    platform: Platform,
-) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
-
-    let environment =
-        lockfile
-            .environment(environment_name)
-            .ok_or(MountError::EnvironmentNotFound {
-                name: environment_name.to_string(),
-            })?;
-    let lock_platform =
-        lockfile
-            .platform(&platform.to_string())
-            .ok_or(MountError::PlatformNotFound {
-                platform,
-                environment: environment_name.to_string(),
-            })?;
-    let packages = environment
-        .packages(lock_platform)
-        .ok_or(MountError::PlatformNotFound {
-            platform,
-            environment: environment_name.to_string(),
-        })?;
-
-    let mut hasher = Sha256::new();
-    hasher.update(ENV_HASH_SCHEMA_VERSION.to_le_bytes());
-
-    // Build an explicit canonical string per package using only the fields
-    // that identify its content.  Sorted before hashing so reordering inside
-    // the lockfile does not change the output.
-    let mut package_keys: Vec<String> = packages
-        .map(|pkg| match pkg {
-            rattler_lock::LockedPackageRef::Conda(c) => {
-                let record = c.record().expect("conda package missing record");
-                let sha_hex = record
-                    .sha256
-                    .as_ref()
-                    .map(|h| format!("{h:x}"))
-                    .unwrap_or_default();
-                if sha_hex.is_empty() {
-                    tracing::warn!(
-                        "package {} has no sha256; env hash may collide across rebuilds",
-                        record.name.as_normalized(),
-                    );
-                }
-                format!(
-                    "conda\0{}\0{}\0{}\0{}\0{}",
-                    record.name.as_normalized(),
-                    record.version,
-                    record.build,
-                    record.subdir,
-                    sha_hex,
-                )
-            }
-            rattler_lock::LockedPackageRef::Pypi(p) => {
-                let sha_hex = match p.as_wheel() {
-                    Some(d) => d
-                        .hash
-                        .as_ref()
-                        .and_then(|h| h.sha256())
-                        .map(|h| format!("{h:x}"))
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                format!(
-                    "pypi\0{}\0{}\0{}\0{}",
-                    p.name(),
-                    p.version_string(),
-                    p.location(),
-                    sha_hex,
-                )
-            }
-        })
-        .collect();
-    package_keys.sort();
-
-    for key in &package_keys {
-        hasher.update(key.as_bytes());
-        hasher.update(b"\n");
-    }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
-}
 
 // ---------------------------------------------------------------------------
 // Internal: transport-specific mount helpers
@@ -1682,24 +1597,4 @@ packages:
   timestamp: 1760831448842
 ";
 
-    #[test]
-    fn test_env_hash_stability() {
-        // Golden test: if this fails, either the canonical form drifted
-        // accidentally (fix the drift) or ENV_HASH_SCHEMA_VERSION was bumped
-        // intentionally (update the expected hash below).
-        let lockfile = rattler_lock::LockFile::from_reader(GOLDEN_LOCKFILE.as_bytes())
-            .expect("golden lockfile should parse");
-
-        let hash =
-            compute_env_hash(&lockfile, "default", Platform::Linux64).expect("hash should succeed");
-
-        // To update: run `cargo test -p rattler_fs test_env_hash_stability`
-        // and copy the "got" value here.
-        assert_eq!(
-            hash, "sha256:e2822c5c31a5cc682a0eb82ef1eb867eec1cde2373bf159a37c7261a23011ecd",
-            "env hash drifted. If intentional (e.g. ENV_HASH_SCHEMA_VERSION bumped), \
-             update this golden value. If accidental, investigate what changed in the \
-             canonical form."
-        );
-    }
 }

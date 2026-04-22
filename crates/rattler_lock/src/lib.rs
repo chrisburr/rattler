@@ -448,6 +448,45 @@ impl<'lock> Environment<'lock> {
             .is_some_and(|mut packages| packages.next().is_some())
     }
 
+    /// Computes a content hash for this environment on the given platform.
+    ///
+    /// The hash captures package locations and integrity digests so that
+    /// consumers (e.g. rattler-fs overlays, pixi prefix caches) can detect
+    /// when an environment has changed and needs to be rebuilt.
+    ///
+    /// Returns `None` when the platform is not part of this environment.
+    pub fn content_hash(&self, platform: Platform) -> Option<String> {
+        use rattler_digest::{digest::Digest, Sha256};
+
+        let packages = self.packages(platform)?;
+        let mut hasher = Sha256::new();
+        for package in packages {
+            hasher.update(package.location().to_string().as_bytes());
+            hasher.update([0]);
+            match package {
+                LockedPackageRef::Conda(pack) => {
+                    let record = pack.record();
+                    if let Some(sha) = record.sha256.as_ref() {
+                        hasher.update(sha.as_slice());
+                    } else if let Some(md5) = record.md5.as_ref() {
+                        hasher.update(md5.as_slice());
+                    }
+                }
+                LockedPackageRef::Pypi(pack, _) => {
+                    if let Some(hashes) = pack.hash.as_ref() {
+                        if let Some(sha) = hashes.sha256() {
+                            hasher.update(sha.as_slice());
+                        } else if let Some(md5) = hashes.md5() {
+                            hasher.update(md5.as_slice());
+                        }
+                    }
+                }
+            }
+            hasher.update([0]);
+        }
+        Some(format!("{:x}", hasher.finalize()))
+    }
+
     /// Creates a [`OwnedEnvironment`] from this environment.
     pub fn to_owned(self) -> OwnedEnvironment {
         OwnedEnvironment {
