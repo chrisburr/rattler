@@ -8,24 +8,22 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use rattler_fs::{MountConfig, Transport, build_and_mount};
-//! use rattler_cache::{default_cache_dir, package_cache::PackageCache};
-//! use rattler_conda_types::Platform;
-//! use rattler_lock::LockFile;
+//! use std::path::PathBuf;
+//! use rattler_fs::{Layout, MountConfig, Transport, VirtualFile, build_and_mount};
+//! use rattler_fs::package_source::{CondaPackage, PackageSource};
 //! # async fn example() -> anyhow::Result<()> {
-//! let lockfile = LockFile::from_path("pixi.lock".as_ref())?;
-//! let platform = Platform::current();
-//! let environment = lockfile.environment("default").unwrap();
-//! let lock_platform = lockfile.platform(&platform.to_string()).unwrap();
-//! let env_hash = environment.content_hash(lock_platform).unwrap();
-//! let cache = PackageCache::new(default_cache_dir()?.join("pkgs"));
+//! // Caller is responsible for fetching packages and providing extracted paths.
+//! let layout = Layout::new().with_packages(vec![
+//!     Box::new(CondaPackage::from_extracted("foo", "/cache/foo-1.0".as_ref(), None)?)
+//!         as Box<dyn PackageSource>,
+//! ]);
 //!
 //! let config = MountConfig::new_read_only(
-//!     "/path/to/env".into(),
+//!     PathBuf::from("/path/to/env"),
 //!     Transport::Auto,
-//!     env_hash,
+//!     "env-hash".to_string(),
 //! );
-//! let handle = build_and_mount(&lockfile, "default", platform, &cache, &config).await?;
+//! let handle = build_and_mount(&layout, &config).await?;
 //! // Environment is live at /path/to/env.
 //! // Dropping `handle` unmounts; call `handle.unmount().await` for explicit error handling.
 //! # Ok(())
@@ -77,6 +75,7 @@ pub(crate) mod metadata_tree;
 pub mod nfs_adapter;
 pub mod overlay;
 pub mod overlay_fs;
+pub mod package_source;
 pub mod prefix_replacement;
 #[cfg(target_os = "windows")]
 pub mod projfs_adapter;
@@ -85,19 +84,16 @@ pub mod virtual_fs;
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use metadata_tree::MetadataNode;
-use rattler::install::python_entry_point_template;
-use rattler::install::PythonInfo;
-use rattler_cache::package_cache::PackageCache;
-use rattler_conda_types::package::{EntryPoint, LinkJson, NoArchLinks, PackageFile, PathsJson};
-use rattler_conda_types::Platform;
-use rattler_lock::LockFile;
-use rattler_networking::LazyClient;
+use metadata_tree::{MetadataNode, DEFAULT_FILE_MODE};
+use package_source::{FileContent, PackageFile, PackageSource};
+use rattler_conda_types::package::PathType;
 use virtual_fs::VirtualFS;
+
+pub use package_source::CondaPackage;
 
 // ---------------------------------------------------------------------------
 // Structured errors for downstream consumers (pixi)
@@ -110,17 +106,6 @@ use virtual_fs::VirtualFS;
 /// Use `anyhow::Error::downcast_ref::<MountError>()` to extract them.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
-    /// The requested environment was not found in the lock file.
-    #[error("environment '{name}' not found in lock file")]
-    EnvironmentNotFound { name: String },
-
-    /// No packages for the requested platform in the environment.
-    #[error("no packages for platform {platform} in environment '{environment}'")]
-    PlatformNotFound {
-        platform: Platform,
-        environment: String,
-    },
-
     /// The `ProjFS` optional Windows feature is not enabled.
     #[error(
         "Windows Projected File System (ProjFS) is not available.\n\
@@ -168,90 +153,99 @@ pub enum MountError {
     TransportNotAvailable { transport: Transport },
 }
 
-/// Build a virtual directory tree from a package's `PathsJson`.
-///
-/// Each call extends `env_paths` and `directory_indices` with the entries
-/// from one package. The `cache_path` should point to the extracted package
-/// directory in the cache.
-///
-/// For noarch Python packages, pass `python_info` to rewrite paths:
-/// `site-packages/` → `lib/pythonX.Y/site-packages/` and
-/// `python-scripts/` → `bin/`.
-pub(crate) fn path_parse(
-    paths_json: &PathsJson,
-    cache_path: &Path,
-    python_info: Option<&PythonInfo>,
-    env_paths: &mut Vec<MetadataNode>,
-    directory_indices: &mut HashMap<PathBuf, usize>,
-) {
-    let cachepath: Arc<Path> = cache_path.into();
+/// A synthetic file materialized at tree-build time and mounted alongside the
+/// package contents. Used for caller-supplied markers such as the env-hash
+/// file that downstream tools (e.g. pixi) read to detect stale caches.
+#[derive(Debug, Clone)]
+pub struct VirtualFile {
+    /// Path relative to the mount root (e.g. `conda-meta/rattler-fs_env`).
+    pub relative_path: PathBuf,
+    pub content: Vec<u8>,
+    /// POSIX-style mode bits (default `0o644` if the caller doesn't care).
+    pub mode: u32,
+}
 
-    for path in &paths_json.paths {
-        // For noarch Python packages, rewrite site-packages/ and python-scripts/ paths
-        let (virtual_path, cache_prefix_override) = match python_info {
-            Some(info) => {
-                let rewritten = info.get_python_noarch_target_path(&path.relative_path);
-                if rewritten.as_ref() == path.relative_path {
-                    (path.relative_path.clone(), None)
-                } else {
-                    let original_parent = path
-                        .relative_path
-                        .parent()
-                        .map_or_else(|| PathBuf::from("."), |p| PathBuf::from(".").join(p));
-                    (rewritten.into_owned(), Some(original_parent))
-                }
-            }
-            None => (path.relative_path.clone(), None),
-        };
-
-        let parent_directory = virtual_path.parent().unwrap_or(Path::new("."));
-        let mut parent_index = 0;
-
-        for component in parent_directory.components() {
-            let current_path = env_paths[parent_index]
-                .as_directory()
-                .expect("parent is always a directory")
-                .prefix_path
-                .join(component);
-
-            if let Some(&index) = directory_indices.get(&current_path) {
-                parent_index = index;
-            } else {
-                let new_dir = MetadataNode::new_directory(current_path.clone(), parent_index);
-                let child_index = env_paths.len();
-
-                env_paths.push(new_dir);
-                env_paths[parent_index]
-                    .as_directory_mut()
-                    .expect("parent is a directory")
-                    .children
-                    .push(child_index);
-
-                directory_indices.insert(current_path, child_index);
-                parent_index = child_index;
-            }
+impl VirtualFile {
+    pub fn new(relative_path: impl Into<PathBuf>, content: impl Into<Vec<u8>>) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            content: content.into(),
+            mode: DEFAULT_FILE_MODE,
         }
+    }
+}
 
-        let file_name = virtual_path.file_name().expect("files always have names");
+/// How the tree-builder should resolve two sources contributing the same
+/// `(parent_directory, file_name)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionPolicy {
+    /// The first source to insert a given path wins; subsequent inserts are
+    /// silently dropped (logged at `debug`). Matches rattler-fs's pre-refactor
+    /// implicit behavior and is the right default for conda-only mounts.
+    FirstWins,
+    /// The last source to insert a given path wins; earlier nodes are
+    /// replaced and a `warn` is logged. Intended for wheel-over-conda
+    /// shadowing once pypi support lands.
+    LastWins,
+    /// Any collision aborts the build with a structured error. Useful for
+    /// tests and for callers who want to surface overlapping package
+    /// contents explicitly.
+    Error,
+}
 
-        let file_index = env_paths.len();
-        let mut file_entry = MetadataNode::new_file(
-            file_name.into(),
-            parent_index,
-            cachepath.clone(),
-            path.path_type,
-            path.prefix_placeholder.clone(),
-        );
-        if let Some(ref override_path) = cache_prefix_override {
-            file_entry.as_file_mut().unwrap().cache_prefix_path = Some(override_path.clone());
+impl Default for CollisionPolicy {
+    fn default() -> Self {
+        Self::FirstWins
+    }
+}
+
+/// The "what to serve" half of a mount, bundled so it can be built and
+/// validated independently of the mount transport and overlay options in
+/// [`MountConfig`].
+pub struct Layout {
+    /// Package sources to mount. Each source's files are inserted in iteration
+    /// order; collisions within or across sources follow `collision_policy`.
+    pub packages: Vec<Box<dyn PackageSource>>,
+    /// Caller-injected synthetic files overlaid on top of the package
+    /// contributions (inserted last, so `LastWins` callers can use them to
+    /// shadow package files).
+    pub virtual_files: Vec<VirtualFile>,
+    /// Collision handling for overlapping `(parent, name)` inserts.
+    pub collision_policy: CollisionPolicy,
+}
+
+impl Layout {
+    /// Empty layout with the default [`CollisionPolicy::FirstWins`].
+    pub fn new() -> Self {
+        Self {
+            packages: Vec::new(),
+            virtual_files: Vec::new(),
+            collision_policy: CollisionPolicy::default(),
         }
-        env_paths.push(file_entry);
+    }
 
-        env_paths[parent_index]
-            .as_directory_mut()
-            .expect("parent is a directory")
-            .children
-            .push(file_index);
+    /// Builder-style package list setter.
+    pub fn with_packages(mut self, packages: Vec<Box<dyn PackageSource>>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    /// Builder-style virtual-files list setter.
+    pub fn with_virtual_files(mut self, virtual_files: Vec<VirtualFile>) -> Self {
+        self.virtual_files = virtual_files;
+        self
+    }
+
+    /// Builder-style collision-policy setter.
+    pub fn with_collision_policy(mut self, policy: CollisionPolicy) -> Self {
+        self.collision_policy = policy;
+        self
+    }
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -278,31 +272,130 @@ fn ensure_directory(
     child_index
 }
 
-/// Generate noarch python entry point scripts and add them as virtual files
-/// in the metadata tree.
-pub(crate) fn add_entry_points(
-    entry_points: &[EntryPoint],
-    target_prefix: &str,
-    python_info: &PythonInfo,
+/// Walk `file.relative_path`, creating any missing ancestor directories, then
+/// insert the file as a leaf under its parent. `file_indices` memoises the
+/// `(parent_index, file_name)` pairs that already have a node so collision
+/// checks stay O(1) no matter how many files share a directory — critical for
+/// directories like site-packages that routinely hold thousands of entries.
+fn upsert_file(
     env_paths: &mut Vec<MetadataNode>,
     directory_indices: &mut HashMap<PathBuf, usize>,
-) {
-    let bin_dir = PathBuf::from("./bin");
-    let bin_index = ensure_directory(bin_dir, 0, env_paths, directory_indices);
+    file_indices: &mut HashMap<(usize, OsString), usize>,
+    policy: CollisionPolicy,
+    file: PackageFile,
+) -> anyhow::Result<()> {
+    // Resolve (or create) every ancestor directory so we end up with a valid
+    // parent index. Paths in `PackageFile::relative_path` are treated as
+    // relative to the mount root (represented here by the "." directory at
+    // index 0).
+    let parent_directory = file.relative_path.parent().unwrap_or(Path::new("."));
+    let mut parent_index = 0;
+    for component in parent_directory.components() {
+        let current_path = env_paths[parent_index]
+            .as_directory()
+            .expect("parent is always a directory")
+            .prefix_path
+            .join(component);
+        parent_index =
+            ensure_directory(current_path, parent_index, env_paths, directory_indices);
+    }
 
-    for ep in entry_points {
-        let content = python_entry_point_template(target_prefix, false, ep, python_info);
-        let file_index = env_paths.len();
-        env_paths.push(MetadataNode::new_virtual_file(
-            ep.command.as_str().into(),
-            bin_index,
-            content.into_bytes(),
-        ));
-        env_paths[bin_index]
-            .as_directory_mut()
-            .expect("bin is a directory")
-            .children
-            .push(file_index);
+    let file_name: OsString = file
+        .relative_path
+        .file_name()
+        .expect("files always have names")
+        .to_os_string();
+
+    // Collision check against an already-inserted file at the same
+    // (parent, name). Directories are tracked separately via
+    // `directory_indices` and are deduped by `ensure_directory`, so we only
+    // worry about file-vs-file overlap here.
+    let key = (parent_index, file_name.clone());
+    if let Some(&existing_index) = file_indices.get(&key) {
+        match policy {
+            CollisionPolicy::FirstWins => {
+                tracing::debug!(
+                    "collision at {:?}: keeping first-inserted node (policy=FirstWins)",
+                    file.relative_path
+                );
+                return Ok(());
+            }
+            CollisionPolicy::LastWins => {
+                tracing::warn!(
+                    "collision at {:?}: replacing earlier node (policy=LastWins)",
+                    file.relative_path
+                );
+                env_paths[existing_index] = build_file_node(file_name, parent_index, file);
+                return Ok(());
+            }
+            CollisionPolicy::Error => {
+                anyhow::bail!(
+                    "file collision at {:?} (policy=Error)",
+                    file.relative_path
+                );
+            }
+        }
+    }
+
+    let file_index = env_paths.len();
+    env_paths.push(build_file_node(file_name.clone(), parent_index, file));
+    env_paths[parent_index]
+        .as_directory_mut()
+        .expect("parent is a directory")
+        .children
+        .push(file_index);
+    file_indices.insert((parent_index, file_name), file_index);
+    Ok(())
+}
+
+/// Construct the concrete `MetadataNode::File` for a [`PackageFile`]. Split
+/// out of [`upsert_file`] so both the insert path and the replace path
+/// (`LastWins` collisions) share the construction logic.
+fn build_file_node(
+    file_name: OsString,
+    parent_index: usize,
+    file: PackageFile,
+) -> MetadataNode {
+    match file.content {
+        FileContent::CachedBytes {
+            cache_path,
+            cache_prefix,
+            transform,
+        } => {
+            let mut node = MetadataNode::new_file(
+                file_name,
+                parent_index,
+                cache_path,
+                file.path_type,
+                // new_file currently takes Option<PrefixPlaceholder>; extract
+                // the inner placeholder from the content-transform. Once new
+                // transform variants exist this will need to fan out.
+                transform.and_then(|t| match t {
+                    metadata_tree::ContentTransform::PrefixReplace(p) => Some(p),
+                }),
+            );
+            if let Some(override_path) = cache_prefix {
+                let f = node.as_file_mut().expect("just built a file node");
+                f.cache_prefix_path = Some(override_path);
+            }
+            let f = node.as_file_mut().expect("just built a file node");
+            f.mode = file.mode;
+            node
+        }
+        FileContent::Inline(content) => {
+            let file_mode = file.mode;
+            // Pick the virtual-file constructor whose default mode matches the
+            // caller's request. Either way `f.mode` is stamped afterwards to
+            // preserve any mode bits the constructor doesn't cover.
+            let mut node = if file_mode == metadata_tree::EXECUTABLE_FILE_MODE {
+                MetadataNode::new_virtual_executable(file_name, parent_index, content)
+            } else {
+                MetadataNode::new_virtual_file(file_name, parent_index, content)
+            };
+            let f = node.as_file_mut().expect("just built a file node");
+            f.mode = file_mode;
+            node
+        }
     }
 }
 
@@ -324,6 +417,7 @@ pub(crate) fn new_empty_tree() -> (Vec<MetadataNode>, HashMap<PathBuf, usize>) {
 /// not stable and is intentionally not exposed. The newtype wrapper means
 /// downstream consumers cannot construct one directly — guaranteeing every
 /// mount went through `build_metadata_tree`'s validation.
+#[derive(Debug)]
 pub struct MetadataTree(pub(crate) Vec<MetadataNode>);
 
 /// Transport backend for the virtual filesystem.
@@ -450,8 +544,9 @@ pub struct MountConfig {
     pub transport: Transport,
 
     /// Identity hash of the resolved environment, used to detect when the
-    /// environment has changed and the overlay needs to be reset. Compute
-    /// with [`rattler_lock::Environment::content_hash`].
+    /// environment has changed and the overlay needs to be reset. Callers
+    /// typically derive this from their lock-file representation (e.g.
+    /// `rattler_lock::Environment::content_hash` when using rattler_lock).
     pub env_hash: String,
 
     /// Allow other users to access the mount. Only applies to FUSE; requires
@@ -564,186 +659,60 @@ impl MountHandle {
     }
 }
 
-/// Build the in-memory metadata tree from a parsed lock file.
+/// Build the in-memory metadata tree from a [`Layout`].
 ///
-/// Fetches packages from `package_cache` as needed, reads `PathsJson` for each,
-/// and constructs the virtual directory tree with noarch Python path rewriting
-/// and entry point generation.
+/// `rattler_fs` has no knowledge of lock files, package caches, or remote
+/// fetches — those concerns belong to the caller (see `rattler-bin`'s `mount`
+/// subcommand for a working example). Each [`PackageSource`] in the layout is
+/// queried for the files it wants to expose; [`Layout::virtual_files`] are
+/// layered on top for synthetic markers (e.g. a content-hash file for
+/// stale-cache detection). Overlapping paths are resolved according to
+/// [`Layout::collision_policy`].
 ///
-/// Caller responsibilities:
-/// - Parse the lock file once via [`LockFile::from_path`].
-/// - Pick a [`Platform`] (usually [`Platform::current()`]).
-/// - Construct a [`PackageCache`] (commonly via
-///   [`rattler_cache::default_cache_dir()`]). Decoupling the cache from this
-///   function lets pixi share its own cache and lets tests use a temp dir.
-pub async fn build_metadata_tree(
-    lockfile: &LockFile,
-    environment_name: &str,
-    platform: Platform,
-    package_cache: &PackageCache,
+/// `mount_point` is passed through to each source so generated content that
+/// bakes in absolute paths (entry-point shebangs, etc.) can reference the
+/// final mount location.
+pub fn build_metadata_tree(
+    layout: &Layout,
     mount_point: &Path,
 ) -> anyhow::Result<MetadataTree> {
-    let environment =
-        lockfile
-            .environment(environment_name)
-            .ok_or(MountError::EnvironmentNotFound {
-                name: environment_name.to_string(),
-            })?;
-    let lock_platform =
-        lockfile
-            .platform(&platform.to_string())
-            .ok_or(MountError::PlatformNotFound {
-                platform,
-                environment: environment_name.to_string(),
-            })?;
-    let package_refs: Vec<_> = environment
-        .packages(lock_platform)
-        .ok_or(MountError::PlatformNotFound {
-            platform,
-            environment: environment_name.to_string(),
-        })?
-        .collect();
-
-    let python_info = package_refs
-        .iter()
-        .filter_map(|p| p.as_binary_conda())
-        .find(|p| p.package_record.name.as_normalized() == "python")
-        .map(|p| PythonInfo::from_python_record(&p.package_record, platform))
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("failed to get python info: {e}"))?;
-
     let (mut env_paths, mut directory_indices) = new_empty_tree();
-    let mount_str = mount_point.to_string_lossy().to_string();
+    let mut file_indices: HashMap<(usize, OsString), usize> = HashMap::new();
 
-    // Build a single lazily-initialized HTTP client for the whole package loop.
-    // `LazyClient::default()` forces construction eagerly, which on macOS walks
-    // the keychain via `rustls_native_certs` and takes several seconds. Using
-    // `LazyClient::new` defers that work until the first cache miss, so
-    // warm-cache mounts skip it entirely.
-    let client = LazyClient::new(reqwest_middleware::ClientWithMiddleware::default);
-
-    // Validate all packages up front so we can parallelize fetching.
-    let mut conda_packages: Vec<_> = package_refs
-        .iter()
-        .filter_map(|p| p.as_binary_conda())
-        .collect();
-
-    // Sort largest first so long downloads start early (mirrors rattler's
-    // installer pattern at installer/mod.rs:600).
-    conda_packages.sort_by(|a, b| {
-        b.package_record
-            .size
-            .unwrap_or(0)
-            .cmp(&a.package_record.size.unwrap_or(0))
-    });
-
-    // Fetch + parse packages in parallel. The tree mutation (path_parse)
-    // stays serial because env_paths/directory_indices are shared mutable
-    // state — the downloads and JSON parses are the expensive parts.
-    let concurrency = Arc::new(tokio::sync::Semaphore::new(16));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for package_data in &conda_packages {
-        let cache = package_cache.clone();
-        let client = client.clone();
-        let record = package_data.package_record.clone();
-        let location = package_data.location.clone();
-        let is_noarch_python = package_data.package_record.noarch.is_python();
-        let sem = concurrency.clone();
-
-        join_set.spawn(async move {
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
-
-            let url = location
-                .as_url()
-                .ok_or_else(|| anyhow::anyhow!("package has no URL"))?
-                .clone();
-            let cache_metadata = cache
-                .get_or_fetch_from_url_with_retry(
-                    &record,
-                    url,
-                    client,
-                    rattler_networking::retry_policies::default_retry_policy(),
-                    None,
-                )
-                .await?;
-
-            // Parse paths.json inside the spawned task to avoid blocking the
-            // main runtime thread.
-            let path = cache_metadata.path().to_path_buf();
-            let paths_json = PathsJson::from_package_directory_with_deprecated_fallback(&path)?;
-
-            // For noarch python packages, also load link.json for entry points.
-            let entry_points: Vec<EntryPoint> = if is_noarch_python {
-                LinkJson::from_package_directory(&path)
-                    .ok()
-                    .and_then(|lj| match lj.noarch {
-                        NoArchLinks::Python(ep) => Some(ep.entry_points),
-                        NoArchLinks::Generic => None,
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            Ok::<_, anyhow::Error>((path, paths_json, is_noarch_python, entry_points))
-        });
+    for pkg in &layout.packages {
+        let files = pkg
+            .files(mount_point)
+            .map_err(|e| anyhow::anyhow!("package '{}': {e}", pkg.name()))?;
+        for file in files {
+            upsert_file(
+                &mut env_paths,
+                &mut directory_indices,
+                &mut file_indices,
+                layout.collision_policy,
+                file,
+            )?;
+        }
+        tracing::debug!(
+            "parsed package '{}': {} metadata entries so far",
+            pkg.name(),
+            env_paths.len()
+        );
     }
 
-    // Collect results and build the tree serially.
-    while let Some(result) = join_set.join_next().await {
-        let (cache_path, paths_json, is_noarch_python, entry_points) =
-            result.map_err(|e| anyhow::anyhow!("fetch task failed: {e}"))??;
-
-        let noarch_python_info = if is_noarch_python {
-            python_info.as_ref()
-        } else {
-            None
+    for vf in &layout.virtual_files {
+        let package_file = PackageFile {
+            relative_path: vf.relative_path.clone(),
+            content: FileContent::Inline(vf.content.clone()),
+            mode: vf.mode,
+            path_type: PathType::HardLink,
         };
-        path_parse(
-            &paths_json,
-            &cache_path,
-            noarch_python_info,
+        upsert_file(
             &mut env_paths,
             &mut directory_indices,
-        );
-
-        if let Some(ref python_info) = python_info {
-            if !entry_points.is_empty() {
-                add_entry_points(
-                    &entry_points,
-                    &mount_str,
-                    python_info,
-                    &mut env_paths,
-                    &mut directory_indices,
-                );
-            }
-        }
-
-        tracing::debug!("parsed {} metadata entries", env_paths.len());
-    }
-
-    // Inject conda-meta/rattler-fs_env virtual file with the environment
-    // content hash. This allows consumers (e.g. pixi) to read the hash from
-    // the mounted filesystem for cache validation, even on read-only mounts.
-    if let Some(content_hash) = environment.content_hash(lock_platform) {
-        let conda_meta_dir = PathBuf::from("./conda-meta");
-        let conda_meta_idx =
-            ensure_directory(conda_meta_dir, 0, &mut env_paths, &mut directory_indices);
-        let file_idx = env_paths.len();
-        env_paths.push(MetadataNode::new_virtual_file(
-            "rattler-fs_env".into(),
-            conda_meta_idx,
-            content_hash.into_bytes(),
-        ));
-        env_paths[conda_meta_idx]
-            .as_directory_mut()
-            .expect("conda-meta is a directory")
-            .children
-            .push(file_idx);
+            &mut file_indices,
+            layout.collision_policy,
+            package_file,
+        )?;
     }
 
     Ok(MetadataTree(env_paths))
@@ -835,28 +804,15 @@ pub async fn mount(metadata: MetadataTree, config: &MountConfig) -> anyhow::Resu
     }
 }
 
-/// Build the metadata tree from a lock file and mount it.
+/// Convenience wrapper that builds the metadata tree and then mounts it.
 ///
-/// This is the main entry point for library consumers. It looks up the
-/// environment + platform in `lockfile`, fetches each package via
-/// `package_cache`, constructs the virtual directory tree, and mounts it.
-/// Returns a [`MountHandle`] that unmounts on drop (or call
-/// [`MountHandle::unmount`] for explicit error handling).
+/// See [`build_metadata_tree`] for the division of responsibilities between
+/// the layout (what to serve) and the mount config (how to serve it).
 pub async fn build_and_mount(
-    lockfile: &LockFile,
-    environment_name: &str,
-    platform: Platform,
-    package_cache: &PackageCache,
+    layout: &Layout,
     config: &MountConfig,
 ) -> anyhow::Result<MountHandle> {
-    let metadata = build_metadata_tree(
-        lockfile,
-        environment_name,
-        platform,
-        package_cache,
-        &config.mount_point,
-    )
-    .await?;
+    let metadata = build_metadata_tree(layout, &config.mount_point)?;
     mount(metadata, config).await
 }
 
@@ -1172,7 +1128,8 @@ pub fn force_unmount(mount_point: &Path, transport: Transport) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rattler_conda_types::package::{PathType, PathsEntry, PathsJson};
+    use rattler::install::PythonInfo;
+    use rattler_conda_types::package::{EntryPoint, PathType, PathsEntry, PathsJson};
     use std::path::PathBuf;
 
     fn make_paths_json(paths: Vec<&str>) -> PathsJson {
@@ -1192,17 +1149,44 @@ mod tests {
         }
     }
 
+    fn make_python_info() -> PythonInfo {
+        use rattler_conda_types::Version;
+        use std::str::FromStr;
+        PythonInfo::from_version(
+            &Version::from_str("3.11.0").unwrap(),
+            None,
+            rattler_conda_types::Platform::Linux64,
+        )
+        .unwrap()
+    }
+
+    fn make_entry_points() -> Vec<EntryPoint> {
+        use std::str::FromStr;
+        vec![
+            EntryPoint::from_str("ipython = IPython:start_ipython").unwrap(),
+            EntryPoint::from_str("ipython3 = IPython:start_ipython").unwrap(),
+        ]
+    }
+
+    /// Wrap a single `CondaPackage` into a [`Layout`], drive it through
+    /// `build_metadata_tree`, and return the flat metadata vec.
+    fn build_from_single_package(pkg: CondaPackage, mount_point: &Path) -> Vec<MetadataNode> {
+        let layout = Layout::new().with_packages(vec![Box::new(pkg)]);
+        let tree = build_metadata_tree(&layout, mount_point).expect("tree build ok");
+        tree.0
+    }
+
     #[test]
     fn test_single_file_at_root() {
         let paths_json = make_paths_json(vec!["foo.txt"]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "pkg",
             Path::new("/cache/pkg"),
+            paths_json,
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         assert_eq!(env_paths.len(), 2); // root + foo.txt
         let root = env_paths[0].as_directory().unwrap();
@@ -1215,14 +1199,14 @@ mod tests {
     #[test]
     fn test_nested_directories() {
         let paths_json = make_paths_json(vec!["a/b/c.txt"]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "pkg",
             Path::new("/cache/pkg"),
+            paths_json,
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         // root, dir "a", dir "a/b", file "c.txt"
         assert_eq!(env_paths.len(), 4);
@@ -1245,14 +1229,14 @@ mod tests {
     #[test]
     fn test_directory_dedup() {
         let paths_json = make_paths_json(vec!["lib/foo", "lib/bar"]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "pkg",
             Path::new("/cache/pkg"),
+            paths_json,
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         // root, dir "lib", file "foo", file "bar"
         assert_eq!(env_paths.len(), 4);
@@ -1266,24 +1250,25 @@ mod tests {
 
     #[test]
     fn test_multiple_packages() {
-        let pkg1 = make_paths_json(vec!["lib/foo.so"]);
-        let pkg2 = make_paths_json(vec!["lib/bar.so"]);
-
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &pkg1,
+        let pkg1 = CondaPackage::from_parts(
+            "pkg1",
             Path::new("/cache/pkg1"),
+            make_paths_json(vec!["lib/foo.so"]),
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
-        path_parse(
-            &pkg2,
+        let pkg2 = CondaPackage::from_parts(
+            "pkg2",
             Path::new("/cache/pkg2"),
+            make_paths_json(vec!["lib/bar.so"]),
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+
+        let layout = Layout::new().with_packages(vec![Box::new(pkg1), Box::new(pkg2)]);
+        let tree =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let env_paths = tree.0;
 
         // root, dir "lib", file "foo.so", file "bar.so"
         assert_eq!(env_paths.len(), 4);
@@ -1300,53 +1285,44 @@ mod tests {
 
     #[test]
     fn test_empty_paths_json() {
-        let paths_json = make_paths_json(vec![]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "pkg",
             Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         assert_eq!(env_paths.len(), 1); // root only
         let root = env_paths[0].as_directory().unwrap();
         assert_eq!(root.children.len(), 0);
     }
 
-    fn make_python_info() -> PythonInfo {
-        use rattler_conda_types::Version;
-        use std::str::FromStr;
-        PythonInfo::from_version(
-            &Version::from_str("3.11.0").unwrap(),
-            None,
-            rattler_conda_types::Platform::Linux64,
-        )
-        .unwrap()
-    }
-
-    fn make_entry_points() -> Vec<EntryPoint> {
-        use std::str::FromStr;
-        vec![
-            EntryPoint::from_str("ipython = IPython:start_ipython").unwrap(),
-            EntryPoint::from_str("ipython3 = IPython:start_ipython").unwrap(),
-        ]
+    /// Index every directory in a built tree by its virtual path. Mirrors the
+    /// old `directory_indices` map that path-parse tests used to inspect.
+    fn collect_directory_indices(env_paths: &[MetadataNode]) -> HashMap<PathBuf, usize> {
+        let mut out = HashMap::new();
+        for (i, n) in env_paths.iter().enumerate() {
+            if let Some(d) = n.as_directory() {
+                out.insert(d.prefix_path.clone(), i);
+            }
+        }
+        out
     }
 
     #[test]
     fn test_entry_points_creates_bin_dir() {
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        let python_info = make_python_info();
-        add_entry_points(
-            &make_entry_points(),
-            "/prefix",
-            &python_info,
-            &mut env_paths,
-            &mut dir_indices,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
+            Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            make_entry_points(),
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
-        // root + bin dir + 2 files
         assert!(dir_indices.contains_key(&PathBuf::from("./bin")));
         let root = env_paths[0].as_directory().unwrap();
         assert_eq!(root.children.len(), 1); // bin dir
@@ -1354,15 +1330,15 @@ mod tests {
 
     #[test]
     fn test_entry_points_adds_files() {
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        let python_info = make_python_info();
-        add_entry_points(
-            &make_entry_points(),
-            "/prefix",
-            &python_info,
-            &mut env_paths,
-            &mut dir_indices,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
+            Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            make_entry_points(),
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
         let bin_idx = dir_indices[&PathBuf::from("./bin")];
         let bin_dir = env_paths[bin_idx].as_directory().unwrap();
@@ -1379,15 +1355,15 @@ mod tests {
 
     #[test]
     fn test_entry_points_virtual_content() {
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        let python_info = make_python_info();
-        add_entry_points(
-            &make_entry_points(),
-            "/prefix",
-            &python_info,
-            &mut env_paths,
-            &mut dir_indices,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
+            Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            make_entry_points(),
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
         let bin_idx = dir_indices[&PathBuf::from("./bin")];
         let bin_dir = env_paths[bin_idx].as_directory().unwrap();
@@ -1414,35 +1390,33 @@ mod tests {
 
     #[test]
     fn test_entry_points_dedup_bin_dir() {
-        // Create a tree that already has bin/ from another package
-        let pkg = make_paths_json(vec!["bin/existing"]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &pkg,
+        // Package 1 already has a bin/ directory with one file in it; package
+        // 2 (the noarch-python one) should merge its entry-point scripts into
+        // the same bin/ rather than creating a duplicate node.
+        let pkg1 = CondaPackage::from_parts(
+            "other",
             Path::new("/cache/pkg"),
+            make_paths_json(vec!["bin/existing"]),
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let pkg2 = CondaPackage::from_parts(
+            "noarch-py",
+            Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            make_entry_points(),
+            Some(make_python_info()),
+        );
+        let layout = Layout::new().with_packages(vec![Box::new(pkg1), Box::new(pkg2)]);
+        let tree =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let env_paths = tree.0;
+        let dir_indices = collect_directory_indices(&env_paths);
 
         let bin_idx = dir_indices[&PathBuf::from("./bin")];
-        let before_children = env_paths[bin_idx].as_directory().unwrap().children.len();
-        assert_eq!(before_children, 1); // just "existing"
-
-        let python_info = make_python_info();
-        add_entry_points(
-            &make_entry_points(),
-            "/prefix",
-            &python_info,
-            &mut env_paths,
-            &mut dir_indices,
-        );
-
-        // bin dir should now have 3 children (existing + ipython + ipython3), not a new bin dir
         let bin_dir = env_paths[bin_idx].as_directory().unwrap();
-        assert_eq!(bin_dir.children.len(), 3);
+        assert_eq!(bin_dir.children.len(), 3); // existing + ipython + ipython3
 
-        // Root should still only have 1 child (the single bin dir)
         let root = env_paths[0].as_directory().unwrap();
         assert_eq!(root.children.len(), 1);
     }
@@ -1451,43 +1425,38 @@ mod tests {
 
     #[test]
     fn test_noarch_python_rewrites_site_packages() {
-        let paths_json = make_paths_json(vec![
-            "site-packages/foo/__init__.py",
-            "site-packages/foo/bar.py",
-        ]);
-        let python_info = make_python_info(); // python 3.11
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
             Path::new("/cache/pkg"),
-            Some(&python_info),
-            &mut env_paths,
-            &mut dir_indices,
+            make_paths_json(vec![
+                "site-packages/foo/__init__.py",
+                "site-packages/foo/bar.py",
+            ]),
+            vec![],
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
-        // Should have: lib/python3.11/site-packages/foo/ directory structure
         assert!(dir_indices.contains_key(&PathBuf::from("./lib")));
         assert!(dir_indices.contains_key(&PathBuf::from("./lib/python3.11")));
         assert!(dir_indices.contains_key(&PathBuf::from("./lib/python3.11/site-packages")));
         assert!(dir_indices.contains_key(&PathBuf::from("./lib/python3.11/site-packages/foo")));
-        // Should NOT have bare site-packages at root
         assert!(!dir_indices.contains_key(&PathBuf::from("./site-packages")));
     }
 
     #[test]
     fn test_noarch_python_rewrites_python_scripts() {
-        let paths_json = make_paths_json(vec!["python-scripts/mycmd"]);
-        let python_info = make_python_info();
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
             Path::new("/cache/pkg"),
-            Some(&python_info),
-            &mut env_paths,
-            &mut dir_indices,
+            make_paths_json(vec!["python-scripts/mycmd"]),
+            vec![],
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
-        // Should appear under bin/
         assert!(dir_indices.contains_key(&PathBuf::from("./bin")));
         let bin_idx = dir_indices[&PathBuf::from("./bin")];
         let bin_dir = env_paths[bin_idx].as_directory().unwrap();
@@ -1498,25 +1467,21 @@ mod tests {
 
     #[test]
     fn test_noarch_python_preserves_cache_path() {
-        let paths_json = make_paths_json(vec!["site-packages/foo/bar.py"]);
-        let python_info = make_python_info();
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
             Path::new("/cache/noarch-pkg"),
-            Some(&python_info),
-            &mut env_paths,
-            &mut dir_indices,
+            make_paths_json(vec!["site-packages/foo/bar.py"]),
+            vec![],
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
-        // Find bar.py
         let foo_idx = dir_indices[&PathBuf::from("./lib/python3.11/site-packages/foo")];
         let foo_dir = env_paths[foo_idx].as_directory().unwrap();
         let file = env_paths[foo_dir.children[0]].as_file().unwrap();
 
-        // cache_base_path points to the package cache
         assert_eq!(&*file.cache_base_path, Path::new("/cache/noarch-pkg"));
-        // cache_prefix_path overrides to original on-disk location
         assert_eq!(
             file.cache_prefix_path.as_deref(),
             Some(Path::new("./site-packages/foo"))
@@ -1525,17 +1490,15 @@ mod tests {
 
     #[test]
     fn test_noarch_non_rewritten_paths_unchanged() {
-        // Files not under site-packages/ or python-scripts/ should be unchanged
-        let paths_json = make_paths_json(vec!["share/data/file.txt"]);
-        let python_info = make_python_info();
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        let pkg = CondaPackage::from_parts(
+            "noarch-py",
             Path::new("/cache/pkg"),
-            Some(&python_info),
-            &mut env_paths,
-            &mut dir_indices,
+            make_paths_json(vec!["share/data/file.txt"]),
+            vec![],
+            Some(make_python_info()),
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
         assert!(dir_indices.contains_key(&PathBuf::from("./share")));
         assert!(dir_indices.contains_key(&PathBuf::from("./share/data")));
@@ -1544,57 +1507,130 @@ mod tests {
             .as_file()
             .unwrap();
         assert_eq!(file.file_name, "file.txt");
-        // No cache_prefix_path override needed
         assert!(file.cache_prefix_path.is_none());
     }
 
     #[test]
     fn test_non_noarch_no_rewrite() {
-        // Without python_info, site-packages/ stays as-is
-        let paths_json = make_paths_json(vec!["site-packages/foo/bar.py"]);
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
+        // Without python_info, site-packages/ stays as-is.
+        let pkg = CondaPackage::from_parts(
+            "pkg",
             Path::new("/cache/pkg"),
+            make_paths_json(vec!["site-packages/foo/bar.py"]),
+            vec![],
             None,
-            &mut env_paths,
-            &mut dir_indices,
         );
+        let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
+        let dir_indices = collect_directory_indices(&env_paths);
 
         assert!(dir_indices.contains_key(&PathBuf::from("./site-packages")));
         assert!(!dir_indices.contains_key(&PathBuf::from("./lib")));
     }
 
-    /// Minimal v6 lockfile with 2 conda packages (non-alphabetical order)
-    /// used exclusively for the env hash golden test. Unlike the full
-    /// test-data/rattler-fs/pixi.lock, this fixture never changes when
-    /// upstream dependencies are bumped.
-    const GOLDEN_LOCKFILE: &str = "\
-version: 6
-environments:
-  default:
-    channels:
-    - url: https://prefix.dev/conda-forge/
-    packages:
-      linux-64:
-      - conda: https://prefix.dev/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
-      - conda: https://prefix.dev/conda-forge/noarch/iniconfig-2.3.0-pyhd8ed1ab_0.conda
-packages:
-- conda: https://prefix.dev/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
-  sha256: 1d30098909076af33a35017eed6f2953af1c769e273a0626a04722ac4acaba3c
-  md5: ad659d0a2b3e47e38d829aa8cad2d610
-  license: LicenseRef-Public-Domain
-  size: 119135
-  timestamp: 1767016325805
-- conda: https://prefix.dev/conda-forge/noarch/iniconfig-2.3.0-pyhd8ed1ab_0.conda
-  sha256: e1a9e3b1c8fe62dc3932a616c284b5d8cbe3124bbfbedcf4ce5c828cb166ee19
-  md5: 9614359868482abba1bd15ce465e3c42
-  depends:
-  - python >=3.10
-  license: MIT
-  license_family: MIT
-  size: 13387
-  timestamp: 1760831448842
-";
+    #[test]
+    fn test_virtual_file_injection() {
+        let pkg = CondaPackage::from_parts(
+            "pkg",
+            Path::new("/cache/pkg"),
+            make_paths_json(vec![]),
+            vec![],
+            None,
+        );
+        let layout = Layout::new()
+            .with_packages(vec![Box::new(pkg)])
+            .with_virtual_files(vec![VirtualFile::new(
+                "conda-meta/rattler-fs_env",
+                b"abc123".to_vec(),
+            )]);
+        let tree =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let env_paths = tree.0;
+        let dir_indices = collect_directory_indices(&env_paths);
 
+        let conda_meta_idx = dir_indices[&PathBuf::from("./conda-meta")];
+        let conda_meta = env_paths[conda_meta_idx].as_directory().unwrap();
+        let file = env_paths[conda_meta.children[0]].as_file().unwrap();
+        assert_eq!(file.file_name, "rattler-fs_env");
+        assert_eq!(file.virtual_content.as_deref(), Some(b"abc123".as_slice()));
+    }
+
+    // --- CollisionPolicy tests ---
+
+    fn make_colliding_packages() -> (Box<dyn PackageSource>, Box<dyn PackageSource>) {
+        let pkg1 = CondaPackage::from_parts(
+            "pkg1",
+            Path::new("/cache/pkg1"),
+            make_paths_json(vec!["lib/shared.so"]),
+            vec![],
+            None,
+        );
+        let pkg2 = CondaPackage::from_parts(
+            "pkg2",
+            Path::new("/cache/pkg2"),
+            make_paths_json(vec!["lib/shared.so"]),
+            vec![],
+            None,
+        );
+        (Box::new(pkg1), Box::new(pkg2))
+    }
+
+    #[test]
+    fn test_collision_first_wins_keeps_pkg1() {
+        let (pkg1, pkg2) = make_colliding_packages();
+        let layout = Layout::new()
+            .with_packages(vec![pkg1, pkg2])
+            .with_collision_policy(CollisionPolicy::FirstWins);
+        let tree =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let env_paths = tree.0;
+
+        // There should be exactly one file under lib/ and it should point at
+        // pkg1's cache path, not pkg2's.
+        let lib_dir = env_paths
+            .iter()
+            .find_map(|n| {
+                n.as_directory()
+                    .filter(|d| d.prefix_path == PathBuf::from("./lib"))
+            })
+            .expect("lib dir present");
+        assert_eq!(lib_dir.children.len(), 1);
+        let file = env_paths[lib_dir.children[0]].as_file().unwrap();
+        assert_eq!(&*file.cache_base_path, Path::new("/cache/pkg1"));
+    }
+
+    #[test]
+    fn test_collision_last_wins_keeps_pkg2() {
+        let (pkg1, pkg2) = make_colliding_packages();
+        let layout = Layout::new()
+            .with_packages(vec![pkg1, pkg2])
+            .with_collision_policy(CollisionPolicy::LastWins);
+        let tree =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let env_paths = tree.0;
+
+        let lib_dir = env_paths
+            .iter()
+            .find_map(|n| {
+                n.as_directory()
+                    .filter(|d| d.prefix_path == PathBuf::from("./lib"))
+            })
+            .expect("lib dir present");
+        assert_eq!(lib_dir.children.len(), 1);
+        let file = env_paths[lib_dir.children[0]].as_file().unwrap();
+        assert_eq!(&*file.cache_base_path, Path::new("/cache/pkg2"));
+    }
+
+    #[test]
+    fn test_collision_error_aborts() {
+        let (pkg1, pkg2) = make_colliding_packages();
+        let layout = Layout::new()
+            .with_packages(vec![pkg1, pkg2])
+            .with_collision_policy(CollisionPolicy::Error);
+        let err =
+            build_metadata_tree(&layout, Path::new("/prefix")).expect_err("should collide");
+        assert!(
+            err.to_string().contains("collision"),
+            "unexpected error: {err}"
+        );
+    }
 }

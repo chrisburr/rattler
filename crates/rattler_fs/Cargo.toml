@@ -19,12 +19,7 @@ rattler = { workspace = true, default-features = false }
 reflink-copy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-rattler_cache = { workspace = true, default-features = false }
 rattler_conda_types = { workspace = true }
-rattler_lock = { workspace = true }
-rattler_networking = { workspace = true, default-features = false }
-reqwest-middleware = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal"] }
 tracing = { workspace = true }
 
@@ -44,8 +39,7 @@ fuser = { workspace = true }
 # macOS-only dependencies:
 # - fuser is opt-in (requires macFUSE installed system-wide)
 # - sha2-asm accelerates the codesign module, which rehashes every page of a
-#   Mach-O binary on every mount (hot path). Linux and Windows only use sha2
-#   for compute_env_hash, which runs once per mount.
+#   Mach-O binary on every mount (hot path).
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { workspace = true, optional = true }
 sha2 = { workspace = true, features = ["asm"] }
@@ -59,11 +53,7 @@ nfs = ["dep:nfs3_server", "dep:nfs3_types"]
 fuse = ["dep:fuser"]  # only meaningful on macOS
 native-tls = [
   "rattler/native-tls",
-  "rattler_cache/native-tls",
-  "rattler_networking/native-tls",
 ]
 rustls-tls = [
   "rattler/rustls-tls",
-  "rattler_cache/rustls-tls",
-  "rattler_networking/rustls-tls",
 ]

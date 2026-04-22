@@ -55,7 +55,7 @@ impl VirtualFS {
             let Some(file) = metadata[i].as_file() else {
                 continue;
             };
-            let Some(placeholder) = &file.prefix_placeholder else {
+            let Some(placeholder) = file.prefix_placeholder() else {
                 continue;
             };
 
@@ -170,7 +170,12 @@ impl VirtualFS {
             MetadataNode::Directory(_) => self.make_attr(ino, 0, FileKind::Directory, 0o755),
             MetadataNode::File(file) => {
                 if let Some(ref content) = file.virtual_content {
-                    return self.make_attr(ino, content.len() as u64, FileKind::RegularFile, 0o775);
+                    return self.make_attr(
+                        ino,
+                        content.len() as u64,
+                        FileKind::RegularFile,
+                        file.mode as u16,
+                    );
                 }
 
                 let path = self._getpath(file);
@@ -185,7 +190,7 @@ impl VirtualFS {
                     }
                     Err(e) => {
                         tracing::warn!("failed to stat {}: {}", path.display(), e);
-                        self.make_attr(ino, 0, FileKind::RegularFile, 0o644)
+                        self.make_attr(ino, 0, FileKind::RegularFile, file.mode as u16)
                     }
                 }
             }
@@ -244,7 +249,7 @@ impl VirtualFS {
             return Ok(ContentSource::Virtual);
         }
 
-        if current_file.prefix_placeholder.is_some() {
+        if current_file.transform.is_some() {
             return Ok(ContentSource::Transformed);
         }
 
@@ -272,8 +277,8 @@ impl VirtualFS {
 
         let path = self._getpath(current_file);
 
-        // Files without prefix replacement: read directly from disk
-        if current_file.prefix_placeholder.is_none() {
+        // Files without transforms: read directly from disk
+        let Some(placeholder) = current_file.prefix_placeholder() else {
             let mut file = File::open(&path).map_err(|e| {
                 tracing::warn!("failed to open {}: {}", path.display(), e);
                 EIO
@@ -289,10 +294,7 @@ impl VirtualFS {
             })?;
             buf.truncate(n);
             return Ok(buf);
-        }
-
-        // Has prefix placeholder — use ranged replacement
-        let placeholder = current_file.prefix_placeholder.as_ref().unwrap();
+        };
 
         let file = File::open(&path).map_err(|e| {
             tracing::warn!("failed to open {}: {}", path.display(), e);
@@ -485,15 +487,37 @@ impl VfsOps for VirtualFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{new_empty_tree, path_parse};
+    use crate::{build_metadata_tree, package_source::PackageSource, CondaPackage, Layout};
+    use rattler::install::PythonInfo;
     use rattler_conda_types::package::{
-        FileMode, PathType, PathsEntry, PathsJson, PrefixPlaceholder,
+        EntryPoint, FileMode, PathType, PathsEntry, PathsJson, PrefixPlaceholder,
     };
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file as symlink;
     use tempfile::TempDir;
+
+    /// Run the full tree-build pipeline against a single `CondaPackage` and
+    /// hand back the internal metadata vec.
+    fn build_single_package_tree(
+        extracted_path: &Path,
+        paths_json: PathsJson,
+        entry_points: Vec<EntryPoint>,
+        python_info: Option<PythonInfo>,
+        mount_point: &Path,
+    ) -> Vec<crate::metadata_tree::MetadataNode> {
+        let pkg = CondaPackage::from_parts(
+            "test",
+            extracted_path,
+            paths_json,
+            entry_points,
+            python_info,
+        );
+        let layout = Layout::new().with_packages(vec![Box::new(pkg) as Box<dyn PackageSource>]);
+        let tree = build_metadata_tree(&layout, mount_point).expect("tree build ok");
+        tree.0
+    }
 
     /// Build a test fixture:
     /// ```text
@@ -588,16 +612,9 @@ mod tests {
             paths_version: 1,
         };
 
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
-            cache_path,
-            None,
-            &mut env_paths,
-            &mut dir_indices,
-        );
-
         let mount_point = PathBuf::from("/new/prefix");
+        let env_paths =
+            build_single_package_tree(cache_path, paths_json, vec![], None, &mount_point);
         let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
 
         (tmpdir, vfs)
@@ -931,32 +948,25 @@ mod tests {
             paths_version: 1,
         };
 
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
-            cache_path,
-            None,
-            &mut env_paths,
-            &mut dir_indices,
-        );
-
-        // Add a virtual entry point
+        // Add a virtual entry point via a noarch-python CondaPackage.
         let python_info = PythonInfo::from_version(
             &Version::from_str("3.11.0").unwrap(),
             None,
             Platform::Linux64,
         )
         .unwrap();
-        let ep = rattler_conda_types::package::EntryPoint::from_str("mytool = mymod:main").unwrap();
-        crate::add_entry_points(
-            &[ep],
-            "/new/prefix",
-            &python_info,
-            &mut env_paths,
-            &mut dir_indices,
+        let ep = EntryPoint::from_str("mytool = mymod:main").unwrap();
+
+        let mount_point = PathBuf::from("/new/prefix");
+        let env_paths = build_single_package_tree(
+            cache_path,
+            paths_json,
+            vec![ep],
+            Some(python_info),
+            &mount_point,
         );
 
-        let vfs = VirtualFS::with_platform(env_paths, Path::new("/new/prefix"), Platform::Linux64);
+        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
         (tmpdir, vfs)
     }
 
@@ -975,7 +985,7 @@ mod tests {
         let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();
         let ep_attr = vfs.do_lookup(bin_attr.ino, OsStr::new("mytool")).unwrap();
         assert_eq!(ep_attr.kind, FileKind::RegularFile);
-        assert_eq!(ep_attr.perm, 0o775); // executable
+        assert_eq!(ep_attr.perm, 0o755); // executable
         assert!(ep_attr.size > 0);
     }
 
@@ -1024,16 +1034,14 @@ mod tests {
         )
         .unwrap();
 
-        let (mut env_paths, mut dir_indices) = new_empty_tree();
-        path_parse(
-            &paths_json,
-            cache_path,
-            Some(&python_info),
-            &mut env_paths,
-            &mut dir_indices,
-        );
-
         let mount_point = PathBuf::from("/new/prefix");
+        let env_paths = build_single_package_tree(
+            cache_path,
+            paths_json,
+            vec![],
+            Some(python_info),
+            &mount_point,
+        );
         let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
 
         // The file should appear under bin/ in the virtual tree
