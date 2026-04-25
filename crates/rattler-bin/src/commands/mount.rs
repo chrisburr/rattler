@@ -156,11 +156,8 @@ async fn fetch_conda_packages(
     let environment = lockfile
         .environment(environment_name)
         .ok_or_else(|| anyhow::anyhow!("environment '{environment_name}' not found"))?;
-    let lock_platform = lockfile
-        .platform(&platform.to_string())
-        .ok_or_else(|| anyhow::anyhow!("platform '{platform}' not found"))?;
     let package_refs: Vec<_> = environment
-        .packages(lock_platform)
+        .packages(platform)
         .ok_or_else(|| {
             anyhow::anyhow!("no packages for platform {platform} in environment '{environment_name}'")
         })?
