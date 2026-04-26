@@ -67,24 +67,27 @@ jobs:
           key: pixi-${{ matrix.os }}
           shared-key: pixi-${{ matrix.os }}
 
-      # The fork's Cargo.toml has a [patch.crates-io] entry for coalesced_map
-      # pinned to an absolute path on the maintainer's machine. Repoint it at
-      # the rattler checkout sitting next to pixi-src.
+      # The fork's [patch.crates-io] section pins every rattler crate to an
+      # absolute path on the maintainer's machine
+      # (e.g. /Users/cburr/Development/rattler/crates/<name>). Rewrite every
+      # such path to a relative path into the rattler checkout that sits next
+      # to pixi-src.
       - name: Repoint pixi fork patch paths
         shell: bash
         run: |
-          python -c "
+          python - <<'PY'
           import re, pathlib
           p = pathlib.Path('pixi-src/Cargo.toml')
           s = p.read_text()
           s = re.sub(
-              r'coalesced_map\s*=\s*\{\s*path\s*=\s*\"[^\"]+\"\s*\}',
-              'coalesced_map = { path = \"../crates/coalesced_map\" }',
+              r'path\s*=\s*"[^"]*[/\\]rattler[/\\]crates[/\\]([A-Za-z0-9_]+)"',
+              r'path = "../crates/\1"',
               s,
           )
           p.write_text(s)
-          "
-          grep -n coalesced_map pixi-src/Cargo.toml
+          PY
+          echo "--- Patched [patch.crates-io] paths:"
+          grep -E 'path = "\.\./crates/' pixi-src/Cargo.toml || true
 
       - name: Build pixi from fork
         run: pixi run -e default cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi

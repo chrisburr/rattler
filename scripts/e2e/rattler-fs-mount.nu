@@ -501,8 +501,17 @@ if $transport == "nfs" {
     let stale_python = $"($stale_mount)/bin/python3"
     let fs_job_stale = (start_and_wait $fixture_lock $stale_mount $transport [] $stale_log $stale_python)
 
-    # SIGKILL — bypasses graceful shutdown, NFS server dies without unmounting
-    let pid = (ps | where name =~ "rattler" | where command =~ "stale" | get pid | first)
+    # SIGKILL — bypasses graceful shutdown, NFS server dies without unmounting.
+    # `ps -l` is needed to populate the `command` column (full command line);
+    # plain `ps` only returns pid/ppid/name/status/cpu/mem/virtual. Wrap the
+    # `command` access in try/catch: for processes whose command line we
+    # can't read, sysinfo surfaces an error value that breaks `=~`.
+    let pid = (
+        ps -l
+        | where {|p| ($p.name =~ "rattler") and (try { $p.command =~ "stale" } catch { false })}
+        | get pid
+        | first
+    )
     ^kill -9 $pid
     sleep 2sec
 
