@@ -95,16 +95,23 @@ jobs:
       - name: Stage binaries (Unix)
         if: runner.os != 'Windows'
         run: |
-          # On Linux, scripts/activate_linux.sh sets CARGO_TARGET_DIR=.pixi/target
-          # via the pixi env's activation, so the rattler binary lands there
-          # instead of ./target. Honor an explicit env var, then fall back.
-          rattler_dir="${CARGO_TARGET_DIR:-target}"
-          if [ ! -x "${rattler_dir}/release/rattler" ] && [ -x .pixi/target/release/rattler ]; then
-            rattler_dir=.pixi/target
-          fi
+          # On Linux, scripts/activate_linux.sh (run by the pixi default env's
+          # activation) sets CARGO_TARGET_DIR=.pixi/target, so both the rattler
+          # build and the pixi-src build land their outputs there — not in
+          # ./target or pixi-src/target. Honor an explicit env var, then fall
+          # back through the candidate locations.
+          find_bin() {
+            local name="$1"
+            for d in "${CARGO_TARGET_DIR}" "$2" .pixi/target target; do
+              if [ -n "$d" ] && [ -x "$d/release/$name" ]; then
+                echo "$d/release/$name"; return 0
+              fi
+            done
+            echo "could not find $name binary" >&2; return 1
+          }
           mkdir -p bin-staging
-          cp "${rattler_dir}/release/rattler" bin-staging/
-          cp pixi-src/target/release/pixi bin-staging/
+          cp "$(find_bin rattler target)" bin-staging/
+          cp "$(find_bin pixi pixi-src/target)" bin-staging/
           chmod +x bin-staging/rattler bin-staging/pixi
 
       - name: Stage binaries (Windows)
