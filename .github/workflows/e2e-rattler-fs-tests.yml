@@ -35,9 +35,13 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+      # Stable rust from rustup, NOT from the rattler pixi env. The pixi env
+      # leaks dynamic deps (e.g. liblzma, openssl) into the linked binaries
+      # via its activation; those dylibs vanish on the consumer machine and
+      # the binary aborts at startup with `Library not loaded`.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-04-26
         with:
-          environments: default
+          toolchain: "1.93.1"
 
       - name: Install FUSE dev headers (Linux)
         if: runner.os == 'Linux'
@@ -51,7 +55,7 @@ jobs:
           shared-key: rattler-${{ matrix.os }}
 
       - name: Build rattler with mount feature
-        run: pixi run -e default cargo build --release -p rattler-bin --features mount
+        run: cargo build --release -p rattler-bin --features mount
 
       - name: Checkout pixi fork
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -90,7 +94,7 @@ jobs:
           grep -E 'path = "\.\./crates/' pixi-src/Cargo.toml || true
 
       - name: Build pixi from fork
-        run: pixi run -e default cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
+        run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
 
       - name: Stage binaries (Unix)
         if: runner.os != 'Windows'
