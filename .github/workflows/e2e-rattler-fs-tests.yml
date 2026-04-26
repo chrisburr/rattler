@@ -67,6 +67,25 @@ jobs:
           key: pixi-${{ matrix.os }}
           shared-key: pixi-${{ matrix.os }}
 
+      # The fork's Cargo.toml has a [patch.crates-io] entry for coalesced_map
+      # pinned to an absolute path on the maintainer's machine. Repoint it at
+      # the rattler checkout sitting next to pixi-src.
+      - name: Repoint pixi fork patch paths
+        shell: bash
+        run: |
+          python -c "
+          import re, pathlib
+          p = pathlib.Path('pixi-src/Cargo.toml')
+          s = p.read_text()
+          s = re.sub(
+              r'coalesced_map\s*=\s*\{\s*path\s*=\s*\"[^\"]+\"\s*\}',
+              'coalesced_map = { path = \"../crates/coalesced_map\" }',
+              s,
+          )
+          p.write_text(s)
+          "
+          grep -n coalesced_map pixi-src/Cargo.toml
+
       - name: Build pixi from fork
         run: pixi run -e default cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
 
