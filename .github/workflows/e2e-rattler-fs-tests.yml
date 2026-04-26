@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - crates/rattler_fs/**
+      - crates/rattler-bin/**
       - scripts/e2e/rattler-fs-mount.nu
       - test-data/rattler-fs/**
       - .github/workflows/e2e-rattler-fs-tests.yml
@@ -20,16 +21,87 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  e2e-mount:
-    name: ${{ matrix.os }}
+  build-binaries:
+    name: build-binaries (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
 
-    env:
-      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout rattler
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          environments: default
+
+      - name: Install FUSE dev headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      - name: Cache rattler target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: . -> target
+          key: rattler-${{ matrix.os }}
+          shared-key: rattler-${{ matrix.os }}
+
+      - name: Build rattler with mount feature
+        run: pixi run -e default cargo build --release -p rattler-bin --features mount
+
+      - name: Checkout pixi fork
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: chrisburr/pixi
+          ref: feat/rattler-fs
+          path: pixi-src
+
+      - name: Cache pixi target
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: pixi-src -> target
+          key: pixi-${{ matrix.os }}
+          shared-key: pixi-${{ matrix.os }}
+
+      - name: Build pixi from fork
+        run: pixi run -e default cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
+
+      - name: Stage binaries (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bin-staging
+          cp target/release/rattler bin-staging/
+          cp pixi-src/target/release/pixi bin-staging/
+          chmod +x bin-staging/rattler bin-staging/pixi
+
+      - name: Stage binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p bin-staging
+          cp target/release/rattler.exe bin-staging/
+          cp pixi-src/target/release/pixi.exe bin-staging/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bins-${{ matrix.os }}
+          path: bin-staging/
+          retention-days: 1
+          if-no-files-found: error
+
+  e2e-mount:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
 
     steps:
       - name: Checkout source code
@@ -37,9 +109,30 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          environments: rattler-fs
+          name: bins-${{ matrix.os }}
+          path: ${{ runner.temp }}/bins
+
+      - name: Put binaries on PATH (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x "${RUNNER_TEMP}/bins/"*
+          echo "${RUNNER_TEMP}/bins" >> "$GITHUB_PATH"
+
+      - name: Put binaries on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${RUNNER_TEMP}/bins" >> "$GITHUB_PATH"
+
+      - name: Verify binaries
+        shell: bash
+        run: |
+          which pixi
+          pixi --version
+          which rattler
+          rattler --help | head -5
 
       - name: Install FUSE (Linux)
         if: runner.os == 'Linux'
@@ -62,37 +155,40 @@ jobs:
           restore-keys: |
             rattler-fs-pkgs-${{ runner.os }}-
 
+      - name: Install rattler-fs-test pixi env
+        run: pixi install -e rattler-fs-test
+
       # Read-only tests (includes symlink, network failure, and shutdown tests)
       - name: FUSE read-only
         if: runner.os == 'Linux'
         timeout-minutes: 15
         env: {TRANSPORT: fuse, OVERLAY: "false"}
-        run: pixi run -e rattler-fs e2e-rattler-fs
+        run: pixi run -e rattler-fs-test e2e-rattler-fs
 
       - name: NFS read-only
         if: runner.os != 'Windows'
         timeout-minutes: 15
         env: {TRANSPORT: nfs, OVERLAY: "false"}
-        run: pixi run -e rattler-fs e2e-rattler-fs
+        run: pixi run -e rattler-fs-test e2e-rattler-fs
 
       # Overlay tests (longer timeout: includes persistence, mismatch, shutdown, and stale mount tests)
       - name: FUSE overlay
         if: runner.os == 'Linux'
         timeout-minutes: 15
         env: {TRANSPORT: fuse, OVERLAY: "true"}
-        run: pixi run -e rattler-fs e2e-rattler-fs
+        run: pixi run -e rattler-fs-test e2e-rattler-fs
 
       - name: NFS overlay
         if: runner.os != 'Windows'
         timeout-minutes: 15
         env: {TRANSPORT: nfs, OVERLAY: "true"}
-        run: pixi run -e rattler-fs e2e-rattler-fs
+        run: pixi run -e rattler-fs-test e2e-rattler-fs
 
       - name: ProjFS overlay
         if: runner.os == 'Windows'
         timeout-minutes: 15
         env: {TRANSPORT: projfs, OVERLAY: "true"}
-        run: pixi run -e rattler-fs e2e-rattler-fs
+        run: pixi run -e rattler-fs-test e2e-rattler-fs
 
       - name: Cleanup mounts
         if: always()

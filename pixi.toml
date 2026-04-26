@@ -128,3 +128,16 @@ e2e-rattler-fs = "nu scripts/e2e/rattler-fs-mount.nu"
 [environments.rattler-fs]
 features = ["rattler-fs"]
 no-default-feature = true
+
+#------------------------------
+# rattler-fs E2E mount test (CI variant: rattler binary supplied externally on PATH)
+#------------------------------
+[feature.rattler-fs-test.dependencies]
+nushell = ">=0.106.1,<0.107"
+
+[feature.rattler-fs-test.tasks]
+e2e-rattler-fs = "nu scripts/e2e/rattler-fs-mount.nu"
+
+[environments.rattler-fs-test]
+features = ["rattler-fs-test"]
+no-default-feature = true
