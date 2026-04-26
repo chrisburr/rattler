@@ -507,31 +507,44 @@ if $transport == "nfs" {
     let fs_job_stale = (start_and_wait $fixture_lock $stale_mount $transport [] $stale_log $stale_python)
 
     # SIGKILL — bypasses graceful shutdown, NFS server dies without unmounting.
-    # `ps -l` is needed to populate the `command` column (full command line);
-    # plain `ps` only returns pid/ppid/name/status/cpu/mem/virtual. Wrap the
-    # `command` access in try/catch: for processes whose command line we
-    # can't read, sysinfo surfaces an error value that breaks `=~`.
-    let pid = (
-        ps -l
-        | where {|p| ($p.name =~ "rattler") and (try { $p.command =~ "stale" } catch { false })}
-        | get pid
-        | first
-    )
-    ^kill -9 $pid
+    # Use `pgrep -f` instead of `ps -l | where command =~ ...`: pgrep is
+    # available on macOS and Linux runners and walks /proc directly without
+    # nushell's sysinfo wrapper (which surfaces error values for the `command`
+    # column on some runners). Fall back to 0 → kill no-op if not found, so
+    # the test fails cleanly instead of hanging.
+    let pid_str = (try { ^pgrep -f "rattler.*stale" | lines | first } catch { "" })
+    if ($pid_str | is-empty) {
+        print "WARN: could not find rattler stale process via pgrep -f"
+    } else {
+        try { ^kill -9 ($pid_str | into int) } catch { }
+    }
     sleep 2sec
 
-    # Mount should be stale — reads should fail
-    let stale_read_failed = try { open $"($stale_mount)/bin/python3" | ignore; false } catch { true }
+    # Mount should be stale — reads should fail.  Wrap with `timeout` so a
+    # hanging NFS read (Linux soft-mount default is hard, and reads block
+    # indefinitely on a dead server) fails the test fast instead of hitting
+    # the step's 15-min wall-clock.
+    let stale_read_failed = try {
+        ^timeout 5 cat $"($stale_mount)/bin/python3" out+err> /dev/null
+        false
+    } catch { true }
 
-    # Force unmount should clean up
+    # Force unmount should clean up.  `-l` (lazy) detaches even when busy.
+    # Wrap with `timeout` because some umount paths (notably stale NFS on
+    # macOS) can themselves block until the kernel times out the server.
     let force_unmount_ok = try {
         if (sys host | get name) == "Linux" {
-            ^sudo umount -f $stale_mount
+            ^timeout 10 sudo umount -f -l $stale_mount
         } else {
-            ^umount -f $stale_mount
+            ^timeout 10 umount -f $stale_mount
         }
         true
     } catch { false }
+
+    # Make sure the spawned job is reaped — nushell will block on script exit
+    # waiting for live jobs, which would mask the test failure as a wall-clock
+    # timeout.
+    try { job kill $fs_job_stale } catch { }
 
     $results = ($results | append (if $stale_read_failed and $force_unmount_ok {
         print "PASS: NFS stale mount detected and force-unmounted"
