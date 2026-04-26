@@ -129,9 +129,18 @@ def stop_and_cleanup [fs_job: int, transport: string, mount: string] {
             try { ^umount $mount } catch { }
         }
     } else if $transport == "nfs" {
-        # Try without sudo first (works on macOS), fall back to sudo (needed on Linux)
-        try { ^umount -f $mount } catch {
-            try { ^sudo umount -f $mount } catch { }
+        # macOS: user-level umount works.
+        # Linux: needs root, AND the userspace helper `umount.nfs` refuses to
+        # detach mounts whose loopback server has died. Bypass it with `-i`
+        # (skip helper) and `-l` (lazy detach) so the kernel always succeeds.
+        # Otherwise stale mounts accumulate across tests and the loopback NFS
+        # subsystem eventually wedges, causing the next mount to hang silently.
+        if (sys host | get name) == "Linux" {
+            try { ^timeout 10 sudo umount -i -f -l $mount } catch { }
+        } else {
+            try { ^timeout 10 umount -f $mount } catch {
+                try { ^timeout 10 sudo umount -f $mount } catch { }
+            }
         }
     }
     # ProjFS: no explicit unmount needed — PrjStopVirtualizing is called on drop.
@@ -532,12 +541,12 @@ if $transport == "nfs" {
         false
     } catch { true }
 
-    # Force unmount should clean up.  `-l` (lazy) detaches even when busy.
-    # Wrap with `timeout` because some umount paths (notably stale NFS on
-    # macOS) can themselves block until the kernel times out the server.
+    # Force unmount should clean up. Linux: `-i` bypasses umount.nfs (which
+    # refuses on a stale mount), `-l` lazy-detaches. macOS: `-f` is enough.
+    # `timeout` guards against macOS umount blocking on a dead NFS server.
     let force_unmount_ok = try {
         if (sys host | get name) == "Linux" {
-            ^timeout 10 sudo umount -f -l $stale_mount
+            ^timeout 10 sudo umount -i -f -l $stale_mount
         } else {
             ^timeout 10 umount -f $stale_mount
         }
