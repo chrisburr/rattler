@@ -291,8 +291,7 @@ fn upsert_file(
             .expect("parent is always a directory")
             .prefix_path
             .join(component);
-        parent_index =
-            ensure_directory(current_path, parent_index, env_paths, directory_indices);
+        parent_index = ensure_directory(current_path, parent_index, env_paths, directory_indices);
     }
 
     let file_name: OsString = file
@@ -324,10 +323,7 @@ fn upsert_file(
                 return Ok(());
             }
             CollisionPolicy::Error => {
-                anyhow::bail!(
-                    "file collision at {:?} (policy=Error)",
-                    file.relative_path
-                );
+                anyhow::bail!("file collision at {:?} (policy=Error)", file.relative_path);
             }
         }
     }
@@ -346,11 +342,7 @@ fn upsert_file(
 /// Construct the concrete `MetadataNode::File` for a [`PackageFile`]. Split
 /// out of [`upsert_file`] so both the insert path and the replace path
 /// (`LastWins` collisions) share the construction logic.
-fn build_file_node(
-    file_name: OsString,
-    parent_index: usize,
-    file: PackageFile,
-) -> MetadataNode {
+fn build_file_node(file_name: OsString, parent_index: usize, file: PackageFile) -> MetadataNode {
     match file.content {
         FileContent::CachedBytes {
             cache_path,
@@ -667,10 +659,7 @@ impl MountHandle {
 /// `mount_point` is passed through to each source so generated content that
 /// bakes in absolute paths (entry-point shebangs, etc.) can reference the
 /// final mount location.
-pub fn build_metadata_tree(
-    layout: &Layout,
-    mount_point: &Path,
-) -> anyhow::Result<MetadataTree> {
+pub fn build_metadata_tree(layout: &Layout, mount_point: &Path) -> anyhow::Result<MetadataTree> {
     let (mut env_paths, mut directory_indices) = new_empty_tree();
     let mut file_indices: HashMap<(usize, OsString), usize> = HashMap::new();
 
@@ -803,14 +792,10 @@ pub async fn mount(metadata: MetadataTree, config: &MountConfig) -> anyhow::Resu
 ///
 /// See [`build_metadata_tree`] for the division of responsibilities between
 /// the layout (what to serve) and the mount config (how to serve it).
-pub async fn build_and_mount(
-    layout: &Layout,
-    config: &MountConfig,
-) -> anyhow::Result<MountHandle> {
+pub async fn build_and_mount(layout: &Layout, config: &MountConfig) -> anyhow::Result<MountHandle> {
     let metadata = build_metadata_tree(layout, &config.mount_point)?;
     mount(metadata, config).await
 }
-
 
 // ---------------------------------------------------------------------------
 // Internal: transport-specific mount helpers
@@ -958,13 +943,16 @@ async fn mount_nfs(
         anyhow::bail!("NFS mount is not supported on this platform. Use ProjFS on Windows.");
     }
 
-    tracing::info!("mounted via NFS on {}", config.mount_point.display());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        tracing::info!("mounted via NFS on {}", config.mount_point.display());
 
-    Ok(nfs_adapter::NfsMountHandle {
-        mount_point: config.mount_point.clone(),
-        server_handle,
-        unmounted: false,
-    })
+        Ok(nfs_adapter::NfsMountHandle {
+            mount_point: config.mount_point.clone(),
+            server_handle,
+            unmounted: false,
+        })
+    }
 }
 
 /// Create an overlay, wiping and retrying transparently on state-version
@@ -1174,13 +1162,8 @@ mod tests {
     #[test]
     fn test_single_file_at_root() {
         let paths_json = make_paths_json(vec!["foo.txt"]);
-        let pkg = CondaPackage::from_parts(
-            "pkg",
-            Path::new("/cache/pkg"),
-            paths_json,
-            vec![],
-            None,
-        );
+        let pkg =
+            CondaPackage::from_parts("pkg", Path::new("/cache/pkg"), paths_json, vec![], None);
         let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         assert_eq!(env_paths.len(), 2); // root + foo.txt
@@ -1194,13 +1177,8 @@ mod tests {
     #[test]
     fn test_nested_directories() {
         let paths_json = make_paths_json(vec!["a/b/c.txt"]);
-        let pkg = CondaPackage::from_parts(
-            "pkg",
-            Path::new("/cache/pkg"),
-            paths_json,
-            vec![],
-            None,
-        );
+        let pkg =
+            CondaPackage::from_parts("pkg", Path::new("/cache/pkg"), paths_json, vec![], None);
         let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         // root, dir "a", dir "a/b", file "c.txt"
@@ -1224,13 +1202,8 @@ mod tests {
     #[test]
     fn test_directory_dedup() {
         let paths_json = make_paths_json(vec!["lib/foo", "lib/bar"]);
-        let pkg = CondaPackage::from_parts(
-            "pkg",
-            Path::new("/cache/pkg"),
-            paths_json,
-            vec![],
-            None,
-        );
+        let pkg =
+            CondaPackage::from_parts("pkg", Path::new("/cache/pkg"), paths_json, vec![], None);
         let env_paths = build_from_single_package(pkg, Path::new("/prefix"));
 
         // root, dir "lib", file "foo", file "bar"
@@ -1261,8 +1234,7 @@ mod tests {
         );
 
         let layout = Layout::new().with_packages(vec![Box::new(pkg1), Box::new(pkg2)]);
-        let tree =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let tree = build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
         let env_paths = tree.0;
 
         // root, dir "lib", file "foo.so", file "bar.so"
@@ -1403,8 +1375,7 @@ mod tests {
             Some(make_python_info()),
         );
         let layout = Layout::new().with_packages(vec![Box::new(pkg1), Box::new(pkg2)]);
-        let tree =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let tree = build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
         let env_paths = tree.0;
         let dir_indices = collect_directory_indices(&env_paths);
 
@@ -1537,8 +1508,7 @@ mod tests {
                 "conda-meta/rattler-fs_env",
                 b"abc123".to_vec(),
             )]);
-        let tree =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let tree = build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
         let env_paths = tree.0;
         let dir_indices = collect_directory_indices(&env_paths);
 
@@ -1575,8 +1545,7 @@ mod tests {
         let layout = Layout::new()
             .with_packages(vec![pkg1, pkg2])
             .with_collision_policy(CollisionPolicy::FirstWins);
-        let tree =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let tree = build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
         let env_paths = tree.0;
 
         // There should be exactly one file under lib/ and it should point at
@@ -1599,8 +1568,7 @@ mod tests {
         let layout = Layout::new()
             .with_packages(vec![pkg1, pkg2])
             .with_collision_policy(CollisionPolicy::LastWins);
-        let tree =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
+        let tree = build_metadata_tree(&layout, Path::new("/prefix")).expect("tree build ok");
         let env_paths = tree.0;
 
         let lib_dir = env_paths
@@ -1621,8 +1589,7 @@ mod tests {
         let layout = Layout::new()
             .with_packages(vec![pkg1, pkg2])
             .with_collision_policy(CollisionPolicy::Error);
-        let err =
-            build_metadata_tree(&layout, Path::new("/prefix")).expect_err("should collide");
+        let err = build_metadata_tree(&layout, Path::new("/prefix")).expect_err("should collide");
         assert!(
             err.to_string().contains("collision"),
             "unexpected error: {err}"

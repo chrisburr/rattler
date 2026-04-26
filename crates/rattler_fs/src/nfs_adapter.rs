@@ -180,6 +180,9 @@ impl NfsServerHandle {
 
 /// Handle to a mounted NFS filesystem. Unmounts and stops the server on drop.
 pub struct NfsMountHandle {
+    // `mount_point` is only consumed by the OS-level umount on macOS/Linux.
+    // Other targets keep the field for parity but never read it.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub(crate) mount_point: std::path::PathBuf,
     pub(crate) server_handle: NfsServerHandle,
     /// Whether `do_unmount` has already run successfully. Set by

@@ -80,12 +80,15 @@ fn anyhow_to_miette(e: anyhow::Error) -> miette::Report {
 pub async fn mount(opt: Opt) -> Result<()> {
     let lockfile = LockFile::from_path(&opt.lock_file).into_diagnostic()?;
     let platform = Platform::current();
-    let environment = lockfile
-        .environment(&opt.environment)
-        .ok_or_else(|| miette::miette!("environment '{}' not found in lock file", opt.environment))?;
-    let env_hash = environment
-        .content_hash(platform)
-        .ok_or_else(|| miette::miette!("platform '{platform}' not in environment '{}'", opt.environment))?;
+    let environment = lockfile.environment(&opt.environment).ok_or_else(|| {
+        miette::miette!("environment '{}' not found in lock file", opt.environment)
+    })?;
+    let env_hash = environment.content_hash(platform).ok_or_else(|| {
+        miette::miette!(
+            "platform '{platform}' not in environment '{}'",
+            opt.environment
+        )
+    })?;
 
     let cache_dir = default_cache_dir().map_err(anyhow_to_miette)?.join("pkgs");
     let package_cache = PackageCache::new(cache_dir);
@@ -159,7 +162,9 @@ async fn fetch_conda_packages(
     let package_refs: Vec<_> = environment
         .packages(platform)
         .ok_or_else(|| {
-            anyhow::anyhow!("no packages for platform {platform} in environment '{environment_name}'")
+            anyhow::anyhow!(
+                "no packages for platform {platform} in environment '{environment_name}'"
+            )
         })?
         .collect();
 
@@ -188,9 +193,8 @@ async fn fetch_conda_packages(
     // Lazy HTTP client: on macOS `ClientWithMiddleware::default()` walks the
     // keychain, which takes seconds. Deferring it means warm-cache mounts
     // skip that work entirely.
-    let client = rattler_networking::LazyClient::new(
-        reqwest_middleware::ClientWithMiddleware::default,
-    );
+    let client =
+        rattler_networking::LazyClient::new(reqwest_middleware::ClientWithMiddleware::default);
     let concurrency = Arc::new(tokio::sync::Semaphore::new(16));
     let mut join_set = tokio::task::JoinSet::new();
 
