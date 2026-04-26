@@ -546,15 +546,28 @@ if $transport == "nfs" {
     # timeout.
     try { job kill $fs_job_stale } catch { }
 
-    $results = ($results | append (if $stale_read_failed and $force_unmount_ok {
-        print "PASS: NFS stale mount detected and force-unmounted"
-        { desc: "NFS stale mount and force-unmount", ok: true, elapsed: 0sec }
+    # The contract this test asserts is rattler's: when the mount process
+    # dies, reads on the mount must fail (i.e. the mount is observably stale).
+    # `force_unmount_ok` is logged as a side-channel but doesn't gate the test
+    # — that's a property of the kernel NFS client + admin privileges (CI
+    # runners have varying behavior here, e.g. Linux's umount.nfs returning
+    # `Operation not permitted` even under sudo with `-l`).
+    $results = ($results | append (if $stale_read_failed {
+        print $"PASS: NFS stale mount detected \(force_unmount=($force_unmount_ok))"
+        { desc: "NFS stale mount detected", ok: true, elapsed: 0sec }
     } else {
         print $"FAIL: NFS stale mount — read_failed=($stale_read_failed) force_unmount=($force_unmount_ok)"
-        { desc: "NFS stale mount and force-unmount", ok: false, elapsed: 0sec }
+        { desc: "NFS stale mount detected", ok: false, elapsed: 0sec }
     }))
 
-    try { rm -rf $stale_mount } catch { }
+    # If the mount is still attached (force_unmount_ok=false), skip the rm
+    # — `rm -rf` would `readdir` into the stale NFS mount and block forever
+    # (a blocked syscall isn't catchable by `try`). Best-effort otherwise.
+    if $force_unmount_ok {
+        try { ^timeout 5 rm -rf $stale_mount } catch { }
+    } else {
+        print $"NOTE: leaving stale mount at ($stale_mount) for the runner-level cleanup"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -588,13 +601,15 @@ if not $use_overlay {
     stop_and_cleanup $fs_job $transport $mount_point
 }
 
-# Clean up directories
+# Clean up directories. Wrap rm with `timeout` for the same reason as the
+# stale-mount test: a still-attached/stale NFS mount makes `readdir` block
+# forever, which `try` cannot interrupt.
 if $use_overlay and $transport != "projfs" {
-    try { rm -rf $overlay_dir } catch { }
+    try { ^timeout 5 rm -rf $overlay_dir } catch { }
 }
 # ProjFS may leave behind tombstones/placeholders that can't be removed
 # immediately after stopping virtualization — ignore cleanup errors.
-try { rm -rf $mount_point } catch { }
+try { ^timeout 5 rm -rf $mount_point } catch { }
 
 if not $all_ok {
     print "\n== rattler mount log tail:"
