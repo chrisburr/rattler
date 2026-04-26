@@ -6,7 +6,7 @@
 //! in [`crate::build_metadata_tree`] iterates sources, collects files, and
 //! wires them into a single [`crate::MetadataTree`].
 //!
-//! Today the one built-in implementor is [`CondaPackage`]. PyPI wheel support
+//! Today the one built-in implementor is [`CondaPackage`]. `PyPI` wheel support
 //! will add more impls without changes to the core tree-builder.
 //!
 //! # Design: why owned values?

@@ -177,11 +177,12 @@ impl VirtualFile {
 
 /// How the tree-builder should resolve two sources contributing the same
 /// `(parent_directory, file_name)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CollisionPolicy {
     /// The first source to insert a given path wins; subsequent inserts are
     /// silently dropped (logged at `debug`). Matches rattler-fs's pre-refactor
     /// implicit behavior and is the right default for conda-only mounts.
+    #[default]
     FirstWins,
     /// The last source to insert a given path wins; earlier nodes are
     /// replaced and a `warn` is logged. Intended for wheel-over-conda
@@ -191,12 +192,6 @@ pub enum CollisionPolicy {
     /// tests and for callers who want to surface overlapping package
     /// contents explicitly.
     Error,
-}
-
-impl Default for CollisionPolicy {
-    fn default() -> Self {
-        Self::FirstWins
-    }
 }
 
 /// The "what to serve" half of a mount, bundled so it can be built and
@@ -370,8 +365,8 @@ fn build_file_node(
                 // new_file currently takes Option<PrefixPlaceholder>; extract
                 // the inner placeholder from the content-transform. Once new
                 // transform variants exist this will need to fan out.
-                transform.and_then(|t| match t {
-                    metadata_tree::ContentTransform::PrefixReplace(p) => Some(p),
+                transform.map(|t| match t {
+                    metadata_tree::ContentTransform::PrefixReplace(p) => p,
                 }),
             );
             if let Some(override_path) = cache_prefix {
@@ -546,7 +541,7 @@ pub struct MountConfig {
     /// Identity hash of the resolved environment, used to detect when the
     /// environment has changed and the overlay needs to be reset. Callers
     /// typically derive this from their lock-file representation (e.g.
-    /// `rattler_lock::Environment::content_hash` when using rattler_lock).
+    /// `rattler_lock::Environment::content_hash` when using `rattler_lock`).
     pub env_hash: String,
 
     /// Allow other users to access the mount. Only applies to FUSE; requires
