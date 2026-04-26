@@ -84,8 +84,13 @@ def expect_fail [desc: string, cmd: closure] {
 # ---------------------------------------------------------------------------
 def start_and_wait [lock: string, mount: string, transport: string, overlay_args: list<string>, log: string, python: string] {
     print $"== Starting rattler mount... \(transport=($transport))"
+    # Wrap the external invocation in try/catch so that when the process is
+    # killed (e.g. SIGKILL in the stale mount test), nushell does not surface
+    # `terminated by signal` as a fatal error from the spawned job.
     let fs_job = job spawn {
-        ^rattler mount $lock $mount --transport $transport ...$overlay_args out+err> $log
+        try {
+            ^rattler mount $lock $mount --transport $transport ...$overlay_args out+err> $log
+        } catch { }
     }
 
     print $"== Waiting for mount... \(checking ($python))"
