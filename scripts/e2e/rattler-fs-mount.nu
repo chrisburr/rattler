@@ -403,7 +403,10 @@ assert data == b'A' * len\(data), 'Content mismatch'
 
     $results = ($results | append (expect_fail "env-hash mismatch rejects stale overlay" {
         let log_mismatch = $"($tmp)/rattler-fs-($transport)($overlay_suffix)-mismatch.log"
-        ^rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
+        # Bounded with `timeout`: rattler should refuse and exit, but if it
+        # hangs (e.g. blocking on cache lock acquisition), `expect_fail`
+        # itself never returns and the whole step times out at 15 min.
+        ^timeout 60 rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
     }))
 
     # --- Transport mismatch rejects mount ---
@@ -417,7 +420,7 @@ assert data == b'A' * len\(data), 'Content mismatch'
 
         $results = ($results | append (expect_fail "transport mismatch rejects mount" {
             let log_transport = $"($tmp)/rattler-fs-($transport)($overlay_suffix)-transport.log"
-            ^rattler mount $fixture_lock $mount_point --transport $other_transport ...$overlay_args out+err> $log_transport
+            ^timeout 60 rattler mount $fixture_lock $mount_point --transport $other_transport ...$overlay_args out+err> $log_transport
         }))
     }
 }
