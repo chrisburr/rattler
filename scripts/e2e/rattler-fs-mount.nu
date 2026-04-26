@@ -308,11 +308,13 @@ if $use_overlay {
     # Large file COW materialization
     $results = ($results | append (run "large file COW materialization" {
         let large_file = $"($mount_point)/large_test.bin"
-        # Write a 10 MB file through the overlay
+        # Write a 10 MB file through the overlay.
+        # Use a Python raw string for the path so Windows backslashes
+        # (e.g. `D:\a\...` → `\a` = BEL) are not interpreted as escapes.
         ^$python_path -c $"
 import os
 data = b'A' * (10 * 1024 * 1024)
-with open\('($large_file)', 'wb') as f:
+with open\(r'($large_file)', 'wb') as f:
     f.write\(data)
 "
         # Verify the file size
@@ -323,7 +325,7 @@ with open\('($large_file)', 'wb') as f:
         }
         # Read back and verify content
         ^$python_path -c $"
-with open\('($large_file)', 'rb') as f:
+with open\(r'($large_file)', 'rb') as f:
     data = f.read\()
 assert len\(data) == 10 * 1024 * 1024, f'Size mismatch: {len\(data)}'
 assert data == b'A' * len\(data), 'Content mismatch'
@@ -432,8 +434,11 @@ if (sys host | get name) != "Windows" {
     mkdir $bad_mount
     let bad_log = $"($tmp)/rattler-fs-bad-url.log"
 
+    # Wrap with `timeout` so a hang in retry/backoff fails the test instead of
+    # the whole step (15 min). `timeout` exits 124 on timeout, which still
+    # satisfies `expect_fail` (any non-zero exit counts).
     $results = ($results | append (expect_fail "mount fails with unreachable package URL" {
-        ^rattler mount $bad_lock $bad_mount --transport $transport out+err> $bad_log
+        ^timeout 60 rattler mount $bad_lock $bad_mount --transport $transport out+err> $bad_log
     }))
 
     try { rm -rf $bad_mount } catch { }

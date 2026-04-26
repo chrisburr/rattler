@@ -1,6 +1,6 @@
 on:
   push:
-    branches: [main]
+    branches: [main, rattler-fs]
   pull_request:
     paths:
       - crates/rattler_fs/**
