@@ -21,8 +21,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-binaries:
-    name: build-binaries (${{ matrix.os }})
+  build-rattler:
+    name: build-rattler (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -56,6 +56,49 @@ jobs:
 
       - name: Build rattler with mount feature
         run: cargo build --release -p rattler-bin --features mount
+
+      - name: Stage rattler (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bin-staging
+          cp target/release/rattler bin-staging/
+          chmod +x bin-staging/rattler
+
+      - name: Stage rattler (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p bin-staging
+          cp target/release/rattler.exe bin-staging/
+
+      - name: Upload rattler binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rattler-${{ matrix.os }}
+          path: bin-staging/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Independent: builds the chrisburr/pixi fork from feat/rattler-fs to make
+  # sure it still compiles with the current rattler crates. NOT on the e2e
+  # critical path — the e2e job uses setup-pixi's pixi for env management.
+  build-pixi-fork:
+    name: build-pixi-fork (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+
+    steps:
+      - name: Checkout rattler
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-04-26
+        with:
+          toolchain: "1.93.1"
 
       - name: Checkout pixi fork
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -96,48 +139,10 @@ jobs:
       - name: Build pixi from fork
         run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
 
-      - name: Stage binaries (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          # On Linux, scripts/activate_linux.sh (run by the pixi default env's
-          # activation) sets CARGO_TARGET_DIR=.pixi/target, so both the rattler
-          # build and the pixi-src build land their outputs there — not in
-          # ./target or pixi-src/target. Honor an explicit env var, then fall
-          # back through the candidate locations.
-          find_bin() {
-            local name="$1"
-            for d in "${CARGO_TARGET_DIR}" "$2" .pixi/target target; do
-              if [ -n "$d" ] && [ -x "$d/release/$name" ]; then
-                echo "$d/release/$name"; return 0
-              fi
-            done
-            echo "could not find $name binary" >&2; return 1
-          }
-          mkdir -p bin-staging
-          cp "$(find_bin rattler target)" bin-staging/
-          cp "$(find_bin pixi pixi-src/target)" bin-staging/
-          chmod +x bin-staging/rattler bin-staging/pixi
-
-      - name: Stage binaries (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p bin-staging
-          cp target/release/rattler.exe bin-staging/
-          cp pixi-src/target/release/pixi.exe bin-staging/
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: bins-${{ matrix.os }}
-          path: bin-staging/
-          retention-days: 1
-          if-no-files-found: error
-
   e2e-mount:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    needs: build-binaries
+    needs: build-rattler
     strategy:
       fail-fast: false
       matrix:
@@ -149,22 +154,26 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download prebuilt binaries
+      - name: Download rattler binary
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: bins-${{ matrix.os }}
+          name: rattler-${{ matrix.os }}
           path: ${{ runner.temp }}/bins
 
-      - name: Put binaries on PATH (Unix)
+      - name: Put rattler on PATH (Unix)
         if: runner.os != 'Windows'
         run: |
           chmod +x "${RUNNER_TEMP}/bins/"*
           echo "${RUNNER_TEMP}/bins" >> "$GITHUB_PATH"
 
-      - name: Put binaries on PATH (Windows)
+      - name: Put rattler on PATH (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: echo "${RUNNER_TEMP}/bins" >> "$GITHUB_PATH"
+
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          environments: rattler-fs-test
 
       - name: Verify binaries
         shell: bash
@@ -194,9 +203,6 @@ jobs:
           key: rattler-fs-pkgs-${{ runner.os }}-${{ hashFiles('test-data/rattler-fs/pixi.lock') }}
           restore-keys: |
             rattler-fs-pkgs-${{ runner.os }}-
-
-      - name: Install rattler-fs-test pixi env
-        run: pixi install -e rattler-fs-test
 
       # Read-only tests (includes symlink, network failure, and shutdown tests)
       - name: FUSE read-only
