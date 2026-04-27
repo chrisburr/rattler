@@ -84,8 +84,15 @@ jobs:
       - name: Stage rattler (Unix)
         if: runner.os != 'Windows'
         run: |
+          # Linux pixi build sets CARGO_TARGET_DIR=.pixi/target via the
+          # activate_linux.sh activation script; macOS uses ./target.
           mkdir -p bin-staging
-          cp target/release/rattler bin-staging/
+          for d in .pixi/target target; do
+            if [ -x "$d/release/rattler" ]; then
+              cp "$d/release/rattler" bin-staging/
+              break
+            fi
+          done
           chmod +x bin-staging/rattler
 
       - name: Stage rattler (Windows)
