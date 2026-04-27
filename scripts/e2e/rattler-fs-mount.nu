@@ -30,7 +30,7 @@ let log_file = $"($tmp)/rattler-fs-($transport)($overlay_suffix).log"
 let fixture_lock = "test-data/rattler-fs/pixi.lock"
 
 # Python location differs by platform
-let python_path = if (sys host | get name) == "Windows" {
+let python_path = if $nu.os-info.name == "windows" {
     $"($mount_point)/python.exe"
 } else {
     $"($mount_point)/bin/python3"
@@ -99,7 +99,7 @@ def start_and_wait [lock: string, mount: string, transport: string, overlay_args
     # the latter calls `fs::metadata`, which blocks uninterruptibly on a stale
     # NFS mount left behind by a prior test's incomplete umount. On Windows
     # there's no analogous hang (ProjFS), so plain `path exists` is fine.
-    let is_windows = ((sys host | get name) == "Windows")
+    let is_windows = ($nu.os-info.name == "windows")
     if not (seq 0 59 | any {|_|
         let exists = if $is_windows {
             ($python | path exists)
@@ -150,7 +150,7 @@ def stop_and_cleanup [fs_job: int, transport: string, mount: string] {
         # `-i` (skip helper) and `-l` (lazy detach) so the kernel always
         # succeeds. Otherwise stale mounts accumulate across tests and the
         # loopback NFS subsystem eventually wedges.
-        if (sys host | get name) == "Linux" {
+        if $nu.os-info.name == "linux" {
             try { ^timeout 10 sudo umount -i -f -l $mount } catch { }
         } else {
             try { ^timeout 10 umount -f $mount } catch {
@@ -202,7 +202,7 @@ let fs_job = (start_and_wait $fixture_lock $mount_point $transport $overlay_args
 # On Windows, conda environments need Library/bin (MKL, OpenBLAS, etc.) on
 # PATH for DLL loading.  Mimic the activation entries that rattler_shell's
 # prefix_path_entries() adds.
-if (sys host | get name) == "Windows" {
+if $nu.os-info.name == "windows" {
     $env.PATH = ([
         $mount_point,
         ($mount_point | path join "Library" "mingw-w64" "bin"),
@@ -214,7 +214,7 @@ if (sys host | get name) == "Windows" {
 }
 
 # Directory traversal (skip on Windows — find not available)
-if (sys host | get name) != "Windows" {
+if $nu.os-info.name != "windows" {
     $results = ($results | append (run_critical "find all files" {
         let count = (^find $mount_point -type f | lines | length)
         print $"  Found ($count) files"
@@ -243,7 +243,7 @@ if not $use_overlay and $transport != "projfs" {
 }
 
 # Symlink resolution (skip on Windows — symlinks handled differently)
-if (sys host | get name) != "Windows" {
+if $nu.os-info.name != "windows" {
     $results = ($results | append (run "symlink resolution" {
         # Find a symlink in the mount and verify its target exists
         let symlinks = (^find $mount_point -type l -maxdepth 3 | lines | first 5)
@@ -440,7 +440,7 @@ assert data == b'A' * len\(data), 'Content mismatch'
         # on cache lock acquisition), `expect_fail` never returns and the
         # whole step times out at 15 min. Windows: no `timeout` binary, and
         # ProjFS doesn't have NFS-style hangs anyway.
-        if (sys host | get name) == "Windows" {
+        if $nu.os-info.name == "windows" {
             ^rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
         } else {
             ^timeout 60 rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
@@ -452,7 +452,7 @@ assert data == b'A' * len\(data), 'Content mismatch'
     # Overlay records which transport created it. Mounting with a different
     # transport must fail rather than silently corrupting state.
     # Only testable on Linux where both FUSE and NFS are available.
-    let other_transport = if $transport == "fuse" { "nfs" } else if $transport == "nfs" and (sys host | get name) == "Linux" { "fuse" } else { "" }
+    let other_transport = if $transport == "fuse" { "nfs" } else if $transport == "nfs" and $nu.os-info.name == "linux" { "fuse" } else { "" }
     if $other_transport != "" {
         print "\n== Transport mismatch test"
 
@@ -469,7 +469,7 @@ assert data == b'A' * len\(data), 'Content mismatch'
 
 # Network failure: mount with an unreachable package URL.
 # Only run on non-Windows (lock file packages differ per platform).
-if (sys host | get name) != "Windows" {
+if $nu.os-info.name != "windows" {
     print "\n== Network failure test"
 
     let bad_lock = $"($tmp)/rattler-fs-bad-url.lock"
@@ -496,7 +496,7 @@ if (sys host | get name) != "Windows" {
 
 # Graceful shutdown with a busy mount (open file handle during kill).
 # Skip on Windows — job/signal semantics differ.
-if (sys host | get name) != "Windows" {
+if $nu.os-info.name != "windows" {
     print "\n== Graceful shutdown test"
 
     let shutdown_mount = $"($tmp)/rattler-fs-shutdown"
@@ -546,7 +546,7 @@ if (sys host | get name) != "Windows" {
 # fresh path then hangs uninterruptibly. macOS NFS already exercises this
 # code path successfully — that's the platform whose unmount-on-stale
 # behavior we actually ship to users.
-if $transport == "nfs" and (sys host | get name) != "Linux" {
+if $transport == "nfs" and $nu.os-info.name != "linux" {
     print "\n== NFS stale mount test"
 
     let stale_mount = $"($tmp)/rattler-fs-stale"
@@ -583,7 +583,7 @@ if $transport == "nfs" and (sys host | get name) != "Linux" {
     # refuses on a stale mount), `-l` lazy-detaches. macOS: `-f` is enough.
     # `timeout` guards against macOS umount blocking on a dead NFS server.
     let force_unmount_ok = try {
-        if (sys host | get name) == "Linux" {
+        if $nu.os-info.name == "linux" {
             ^timeout 10 sudo umount -i -f -l $stale_mount
         } else {
             ^timeout 10 umount -f $stale_mount
