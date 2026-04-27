@@ -35,11 +35,20 @@ jobs:
         with:
           submodules: recursive
 
-      # Stable rust from rustup, NOT from the rattler pixi env. The pixi env
-      # leaks dynamic deps (e.g. liblzma, openssl) into the linked binaries
-      # via its activation; those dylibs vanish on the consumer machine and
-      # the binary aborts at startup with `Library not loaded`.
+      # Linux: build inside the rattler pixi env so we get conda-forge's gcc
+      # toolchain, which targets manylinux_2_17 (glibc 2.17) and produces a
+      # portable binary that works on RHEL/CentOS/AlmaLinux 7+, not just on
+      # the Ubuntu runner's glibc 2.39.
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        if: runner.os == 'Linux'
+        with:
+          environments: default
+
+      # macOS/Windows: stable rust from rustup. We avoid the pixi env on
+      # these because it leaks dynamic deps (e.g. liblzma on macOS) into the
+      # binary, which then fails at startup off the build machine.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-04-26
+        if: runner.os != 'Linux'
         with:
           toolchain: "1.93.1"
 
@@ -47,14 +56,29 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
 
-      - name: Cache rattler target
+      - name: Cache rattler target (non-Linux)
+        if: runner.os != 'Linux'
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: . -> target
           key: rattler-${{ matrix.os }}
           shared-key: rattler-${{ matrix.os }}
 
-      - name: Build rattler with mount feature
+      - name: Cache rattler target (Linux)
+        if: runner.os == 'Linux'
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          # The pixi env's activate_linux.sh sets CARGO_TARGET_DIR=.pixi/target.
+          workspaces: . -> .pixi/target
+          key: rattler-linux-pixi
+          shared-key: rattler-linux-pixi
+
+      - name: Build rattler with mount feature (Linux, via pixi)
+        if: runner.os == 'Linux'
+        run: pixi run -e default cargo build --release -p rattler-bin --features mount
+
+      - name: Build rattler with mount feature (non-Linux)
+        if: runner.os != 'Linux'
         run: cargo build --release -p rattler-bin --features mount
 
       - name: Stage rattler (Unix)
