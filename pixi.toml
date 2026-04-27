@@ -135,6 +135,12 @@ no-default-feature = true
 [feature.rattler-fs-test.dependencies]
 nushell = ">=0.106.1,<0.107"
 
+# GNU `timeout` (from coreutils) is used by the e2e script to bound stuck
+# NFS syscalls. macOS GHA runners don't ship it. Windows uses ProjFS in the
+# tests, which doesn't need it; coreutils isn't available on win-64 either.
+[feature.rattler-fs-test.target.unix.dependencies]
+coreutils = ">=9.5,<10"
+
 [feature.rattler-fs-test.tasks]
 e2e-rattler-fs = "nu scripts/e2e/rattler-fs-mount.nu"
 

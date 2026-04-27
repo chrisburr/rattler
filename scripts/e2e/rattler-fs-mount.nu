@@ -94,13 +94,18 @@ def start_and_wait [lock: string, mount: string, transport: string, overlay_args
     }
 
     print $"== Waiting for mount... \(checking ($python))"
-    # Use external `test -e` wrapped in `timeout` instead of nushell's
-    # `path exists`: the latter calls `fs::metadata`, which blocks
-    # uninterruptibly on a stale NFS mount left behind by a prior test's
-    # incomplete umount. The bounded external check fails after 1s and we
-    # treat it as "not yet ready" so the loop can still time out at 120s.
+    # On unix, use external `test -e` wrapped in `timeout` (provided by the
+    # rattler-fs-test pixi env's coreutils) instead of nushell's `path exists`:
+    # the latter calls `fs::metadata`, which blocks uninterruptibly on a stale
+    # NFS mount left behind by a prior test's incomplete umount. On Windows
+    # there's no analogous hang (ProjFS), so plain `path exists` is fine.
+    let is_windows = ((sys host | get name) == "Windows")
     if not (seq 0 59 | any {|_|
-        let exists = (try { ^timeout 1 test -e $python; true } catch { false })
+        let exists = if $is_windows {
+            ($python | path exists)
+        } else {
+            try { ^timeout 1 test -e $python; true } catch { false }
+        }
         if $exists {
             true
         } else {
@@ -430,10 +435,16 @@ assert data == b'A' * len\(data), 'Content mismatch'
 
     $results = ($results | append (expect_fail "env-hash mismatch rejects stale overlay" {
         let log_mismatch = $"($tmp)/rattler-fs-($transport)($overlay_suffix)-mismatch.log"
-        # Bounded with `timeout`: rattler should refuse and exit, but if it
-        # hangs (e.g. blocking on cache lock acquisition), `expect_fail`
-        # itself never returns and the whole step times out at 15 min.
-        ^timeout 60 rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
+        # Bounded with `timeout` on unix (provided by coreutils in the pixi
+        # env): rattler should refuse and exit, but if it hangs (e.g. blocking
+        # on cache lock acquisition), `expect_fail` never returns and the
+        # whole step times out at 15 min. Windows: no `timeout` binary, and
+        # ProjFS doesn't have NFS-style hangs anyway.
+        if (sys host | get name) == "Windows" {
+            ^rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
+        } else {
+            ^timeout 60 rattler mount $modified_lock $mount_point --transport $transport ...$overlay_args out+err> $log_mismatch
+        }
     }))
 
     # --- Transport mismatch rejects mount ---
