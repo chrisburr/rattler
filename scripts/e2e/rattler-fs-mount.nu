@@ -94,8 +94,14 @@ def start_and_wait [lock: string, mount: string, transport: string, overlay_args
     }
 
     print $"== Waiting for mount... \(checking ($python))"
+    # Use external `test -e` wrapped in `timeout` instead of nushell's
+    # `path exists`: the latter calls `fs::metadata`, which blocks
+    # uninterruptibly on a stale NFS mount left behind by a prior test's
+    # incomplete umount. The bounded external check fails after 1s and we
+    # treat it as "not yet ready" so the loop can still time out at 120s.
     if not (seq 0 59 | any {|_|
-        if ($python | path exists) {
+        let exists = (try { ^timeout 1 test -e $python; true } catch { false })
+        if $exists {
             true
         } else {
             # Check if the process died — no point waiting 120s for a dead process
@@ -129,17 +135,29 @@ def stop_and_cleanup [fs_job: int, transport: string, mount: string] {
             try { ^umount $mount } catch { }
         }
     } else if $transport == "nfs" {
-        # macOS: user-level umount works.
-        # Linux: needs root, AND the userspace helper `umount.nfs` refuses to
-        # detach mounts whose loopback server has died. Bypass it with `-i`
-        # (skip helper) and `-l` (lazy detach) so the kernel always succeeds.
-        # Otherwise stale mounts accumulate across tests and the loopback NFS
-        # subsystem eventually wedges, causing the next mount to hang silently.
+        # macOS: user-level umount works first; if the mount is still
+        # attached (umount returned 0 but cleanup is async, or umount
+        # failed silently), retry with diskutil's force-detach which
+        # guarantees the mount is gone before the next remount tries the
+        # same path.
+        # Linux: needs root, AND the userspace helper `umount.nfs` refuses
+        # to detach mounts whose loopback server has died. Bypass it with
+        # `-i` (skip helper) and `-l` (lazy detach) so the kernel always
+        # succeeds. Otherwise stale mounts accumulate across tests and the
+        # loopback NFS subsystem eventually wedges.
         if (sys host | get name) == "Linux" {
             try { ^timeout 10 sudo umount -i -f -l $mount } catch { }
         } else {
             try { ^timeout 10 umount -f $mount } catch {
                 try { ^timeout 10 sudo umount -f $mount } catch { }
+            }
+            # Verify and force-detach if still mounted (macOS).
+            let still_mounted = (try {
+                let out = (^timeout 5 mount | complete)
+                ($out.stdout | str contains $mount)
+            } catch { false })
+            if $still_mounted {
+                try { ^timeout 10 diskutil unmount force $mount } catch { }
             }
         }
     }
