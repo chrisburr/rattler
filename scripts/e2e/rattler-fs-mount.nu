@@ -458,7 +458,7 @@ if (sys host | get name) != "Windows" {
         ^timeout 60 rattler mount $bad_lock $bad_mount --transport $transport out+err> $bad_log
     }))
 
-    try { rm -rf $bad_mount } catch { }
+    try { ^timeout 5 rm -rf $bad_mount } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -503,7 +503,10 @@ if (sys host | get name) != "Windows" {
     }))
 
     stop_and_cleanup $fs_job_shutdown $transport $shutdown_mount
-    try { rm -rf $shutdown_mount } catch { }
+    # Wrap with `timeout`: if `stop_and_cleanup`'s umount didn't actually
+    # detach (e.g. NFS stuck), `rm -rf` would `readdir` into the still-mounted
+    # path and block forever (a blocked syscall isn't catchable by `try`).
+    try { ^timeout 5 rm -rf $shutdown_mount } catch { }
 }
 
 # NFS stale mount: SIGKILL the process (no cleanup), verify force-unmount works.
