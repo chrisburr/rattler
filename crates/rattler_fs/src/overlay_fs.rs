@@ -82,7 +82,7 @@ impl<T> MutexExt<T> for Mutex<T> {
 
 mod inode;
 
-use crate::overlay::{is_overlay_internal_name, OverlayState, COW_TMP_PREFIX};
+use crate::overlay::{is_marker_name, is_overlay_internal_name, OverlayState, COW_TMP_PREFIX};
 use crate::vfs_ops::{set_file_permissions, ContentSource, DirEntry, FileAttr, FileKind, VfsOps};
 use inode::{ResolvedIno, UpperInodeMap, UPPER_INODE_BASE};
 
@@ -211,6 +211,89 @@ impl<T: VfsOps> OverlayFS<T> {
     /// Get the on-disk upper layer path for a virtual path (no lock needed).
     fn upper_path(&self, virtual_path: &Path) -> PathBuf {
         self.overlay_dir.join(virtual_path)
+    }
+
+    /// Auto-whiteout a lower-layer directory when it has become logically
+    /// empty: every lower child is whiteout'd and upper has no real entries
+    /// (only `.wh.*` markers, if any). Otherwise the dir would still be
+    /// observable by callers like Python's namespace-package importer, which
+    /// scans parent readdir output and treats any matching directory as a
+    /// PEP 420 namespace package — making `import pytest` succeed even after
+    /// every file inside `pytest/` has been individually whiteout'd by pip's
+    /// per-file rename uninstall path.
+    fn maybe_whiteout_empty_lower_dir(&self, path: &Path) -> Result<(), i32> {
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let Some(lower_ino) = self.lower_ino_for_path(path) else {
+            return Ok(());
+        };
+        let Ok(attr) = self.lower.getattr(lower_ino) else {
+            return Ok(());
+        };
+        if attr.kind != FileKind::Directory {
+            return Ok(());
+        }
+
+        // Already whiteout'd? Nothing to do.
+        {
+            let state = self.state.lock_or_eio()?;
+            if state.is_whiteout(path) {
+                return Ok(());
+            }
+        }
+
+        // Any visible lower child? Bail out.
+        let lower_entries = self.lower.readdir(lower_ino, 0).unwrap_or_default();
+        {
+            let state = self.state.lock_or_eio()?;
+            for entry in &lower_entries {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                if !state.is_whiteout(&path.join(&entry.name)) {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Any non-internal upper entry? Bail out.
+        let upper = self.upper_path(path);
+        if let Ok(read_dir) = fs::read_dir(&upper) {
+            for entry in read_dir.flatten() {
+                if !is_overlay_internal_name(&entry.file_name()) {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Strip on-disk markers (so `remove_dir` succeeds) but leave the
+        // in-memory child whiteouts intact — `clear_dir_markers` would also
+        // drop them, and the rmdir lower-emptiness check still scans them
+        // per-child. The parent-level whiteout we add here is what callers
+        // see at lookup time; the redundant child entries are harmless and
+        // get re-synced if the dir is later recreated as opaque.
+        if let Ok(read_dir) = fs::read_dir(&upper) {
+            for entry in read_dir.flatten() {
+                if is_marker_name(&entry.file_name()) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        if upper.exists() {
+            if let Err(e) = fs::remove_dir(&upper) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("auto-whiteout: remove_dir {:?} failed: {}", upper, e);
+                    return Err(EIO);
+                }
+            }
+        }
+        self.state
+            .lock_or_eio()?
+            .add_whiteout(path.to_path_buf())
+            .map_err(|_e| EIO)?;
+        self.invalidate_path_caches(path)?;
+        Ok(())
     }
 
     fn resolve_path(&self, parent: u64, name: &OsStr) -> Result<PathBuf, i32> {
@@ -879,20 +962,26 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
 
         // If this is a lower-layer directory with visible children, reject.
         // The NFS server routes both REMOVE and RMDIR through unlink, so we
-        // must enforce ENOTEMPTY here as well as in rmdir.
-        if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
-            if let Ok(attr) = self.lower.getattr(lower_ino) {
-                if attr.kind == FileKind::Directory {
-                    let state = self.state.lock_or_eio()?;
-                    if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
-                        let has_visible = lower_entries.iter().any(|e| {
-                            if e.name == "." || e.name == ".." {
-                                return false;
+        // must enforce ENOTEMPTY here as well as in rmdir. Skip when the dir
+        // itself is already whiteout'd: a prior auto-whiteout sweep stripped
+        // its in-memory child whiteouts under the parent-whiteout subsumption,
+        // so individual children would now look "visible" again.
+        let parent_whiteoutd = self.state.lock_or_eio()?.is_whiteout(&virtual_path);
+        if !parent_whiteoutd {
+            if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
+                if let Ok(attr) = self.lower.getattr(lower_ino) {
+                    if attr.kind == FileKind::Directory {
+                        let state = self.state.lock_or_eio()?;
+                        if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
+                            let has_visible = lower_entries.iter().any(|e| {
+                                if e.name == "." || e.name == ".." {
+                                    return false;
+                                }
+                                !state.is_whiteout(&virtual_path.join(&e.name))
+                            });
+                            if has_visible {
+                                return Err(libc::ENOTEMPTY);
                             }
-                            !state.is_whiteout(&virtual_path.join(&e.name))
-                        });
-                        if has_visible {
-                            return Err(libc::ENOTEMPTY);
                         }
                     }
                 }
@@ -915,15 +1004,11 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                     .map_err(|_e| EIO)?;
                 if let Err(e2) = fs::remove_dir(&upper_path) {
                     if e2.kind() != std::io::ErrorKind::NotFound {
-                        let leftover: Vec<_> = fs::read_dir(&upper_path)
-                            .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
-                            .unwrap_or_default();
                         tracing::warn!(
-                            "unlink/rmdir failed {:?}: file={}, dir={}, leftover={:?}",
+                            "unlink/rmdir failed {:?}: file={}, dir={}",
                             upper_path,
                             e,
-                            e2,
-                            leftover
+                            e2
                         );
                         return Err(e2.raw_os_error().unwrap_or(EIO));
                     }
@@ -944,6 +1029,10 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // for this path — without this, a kernel handle for the removed
         // file could keep resolving via the stale promoted entry.
         self.invalidate_path_caches(&virtual_path)?;
+
+        if let Some(parent_path) = virtual_path.parent() {
+            self.maybe_whiteout_empty_lower_dir(parent_path)?;
+        }
 
         Ok(())
     }
@@ -981,17 +1070,23 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // may still contain files not covered by whiteouts — removing it would
         // hide them all (the whiteout on the directory itself blocks lookups for
         // every child).
-        if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
-            let state = self.state.lock_or_eio()?;
-            if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
-                let has_visible = lower_entries.iter().any(|e| {
-                    if e.name == "." || e.name == ".." {
-                        return false;
+        // If the dir is already whiteout'd (e.g. promoted by a prior
+        // auto-whiteout sweep when its last child was unlinked), the lower
+        // children are subsumed and we skip the per-child visibility check.
+        let parent_whiteoutd = self.state.lock_or_eio()?.is_whiteout(&virtual_path);
+        if !parent_whiteoutd {
+            if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
+                let state = self.state.lock_or_eio()?;
+                if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
+                    let has_visible = lower_entries.iter().any(|e| {
+                        if e.name == "." || e.name == ".." {
+                            return false;
+                        }
+                        !state.is_whiteout(&virtual_path.join(&e.name))
+                    });
+                    if has_visible {
+                        return Err(libc::ENOTEMPTY);
                     }
-                    !state.is_whiteout(&virtual_path.join(&e.name))
-                });
-                if has_visible {
-                    return Err(libc::ENOTEMPTY);
                 }
             }
         }
@@ -1023,6 +1118,10 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
 
         // Mirror unlink: drop cached state for the removed directory.
         self.invalidate_path_caches(&virtual_path)?;
+
+        if let Some(parent_path) = virtual_path.parent() {
+            self.maybe_whiteout_empty_lower_dir(parent_path)?;
+        }
 
         Ok(())
     }
@@ -1141,6 +1240,12 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // Drop cached lower→ino mapping for the source path (it now
         // points nowhere from the user's view) and any promoted redirect.
         self.invalidate_path_caches(&src_path)?;
+
+        if src_in_lower {
+            if let Some(src_parent) = src_path.parent() {
+                self.maybe_whiteout_empty_lower_dir(src_parent)?;
+            }
+        }
         Ok(())
     }
 
