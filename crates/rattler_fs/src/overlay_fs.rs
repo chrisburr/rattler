@@ -19,7 +19,9 @@ use std::{
 
 mod inode;
 
-use crate::overlay::{OverlayState, STATE_FILENAME, STATE_LOCK_FILENAME, STATE_TMP_FILENAME};
+use crate::overlay::{
+    is_marker_name, OverlayState, STATE_FILENAME, STATE_LOCK_FILENAME, STATE_TMP_FILENAME,
+};
 use crate::vfs_ops::{set_file_permissions, ContentSource, DirEntry, FileAttr, FileKind, VfsOps};
 use inode::{ResolvedIno, UpperInodeMap, UPPER_INODE_BASE};
 
@@ -96,6 +98,13 @@ impl<T: VfsOps> OverlayFS<T> {
 
             // Skip overlay internal files
             if name == STATE_FILENAME || name == STATE_TMP_FILENAME || name == STATE_LOCK_FILENAME {
+                continue;
+            }
+
+            // Whiteout / opaque markers are bookkeeping, not user files —
+            // OverlayState already discovered them; they must NOT receive
+            // inodes (or they'd surface in readdir).
+            if is_marker_name(name) {
                 continue;
             }
 
@@ -569,6 +578,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 if name == STATE_FILENAME
                     || name == STATE_LOCK_FILENAME
                     || name.to_str().is_some_and(|s| s.ends_with(".tmp"))
+                    || is_marker_name(&name)
                 {
                     continue;
                 }
@@ -799,6 +809,18 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             }
         }
 
+        // Drain any per-child `.wh.*` markers from the upper directory
+        // first — otherwise the directory isn't empty and `remove_dir`
+        // would fail. The directory's own whiteout (added below, in the
+        // parent's view) subsumes those per-child markers anyway.
+        if upper_path.exists() {
+            self.state
+                .lock()
+                .unwrap()
+                .clear_dir_markers(&virtual_path)
+                .map_err(|_e| EIO)?;
+        }
+
         if let Err(e) = fs::remove_dir(&upper_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!("rmdir failed {:?}: {}", upper_path, e);
@@ -905,21 +927,16 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         }
 
         // Only track whiteouts for paths that exist in the lower layer.
-        // Single lock acquisition for check + modify to avoid TOCTOU.
+        // Each marker is its own atomic file create — the in-memory cache
+        // and the on-disk markers stay in sync as long as we go through
+        // the API.
         let src_in_lower = self.lower_ino_for_path(&src_path).is_some();
         let mut state = self.state.lock().unwrap();
-        let dst_whiteoutd = state.is_whiteout(&dst_path);
-        let mut dirty = false;
         if src_in_lower {
-            state.whiteouts.insert(src_path.clone());
-            dirty = true;
+            state.add_whiteout(src_path.clone()).map_err(|_e| EIO)?;
         }
-        if dst_whiteoutd {
-            state.whiteouts.remove(&dst_path);
-            dirty = true;
-        }
-        if dirty {
-            state.flush().map_err(|_e| EIO)?;
+        if state.is_whiteout(&dst_path) {
+            state.remove_whiteout(&dst_path).map_err(|_e| EIO)?;
         }
         drop(state);
 

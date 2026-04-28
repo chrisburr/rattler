@@ -1,13 +1,28 @@
 //! Persistent overlay state management.
 //!
-//! Tracks whiteouts (deleted files) and environment identity in a JSON state
-//! file. The state file is written atomically (write-tmp → fsync → rename) on
-//! every mutation for crash safety.
+//! Tracks environment identity and transport in a small JSON state file,
+//! and tracks whiteouts (deleted files) and opaque-dir markers as
+//! `.wh.{name}` and `.wh..wh..opq` files inside the upper directory —
+//! the same on-disk convention used by the Linux kernel's overlayfs and
+//! by many userspace overlays (podman/buildah, fuse-overlayfs).
+//!
+//! Storing whiteouts on disk rather than in JSON has two benefits:
+//!
+//! 1. Out-of-band tools (`tar`, `rsync`, manual file inspection)
+//!    preserve deletion state when copying the upper directory.
+//! 2. Each whiteout/opaque add is a single atomic file create, instead
+//!    of a full state-file rewrite + fsync — `rm -rf` of N files is now
+//!    O(N) writes instead of O(N²).
+//!
+//! The state file is still written atomically (write-tmp → fsync →
+//! rename), but only on mount/unmount and overlay-version migration —
+//! not on every whiteout.
 
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    ffi::{OsStr, OsString},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -16,6 +31,14 @@ use std::{
 pub(crate) const STATE_FILENAME: &str = ".rattler_fs_state.json";
 pub(crate) const STATE_TMP_FILENAME: &str = ".rattler_fs_state.tmp";
 pub(crate) const STATE_LOCK_FILENAME: &str = ".rattler_fs_state.lock";
+
+/// Filename prefix used for whiteout markers (`.wh.{name}` deletes
+/// `{name}` in the parent dir).
+pub(crate) const WHITEOUT_PREFIX: &str = ".wh.";
+
+/// Marker filename for an opaque directory (placed *inside* the dir;
+/// hides every entry in the lower-layer counterpart).
+pub(crate) const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
 #[derive(Debug)]
 pub enum OverlayError {
@@ -89,13 +112,14 @@ impl From<serde_json::Error> for OverlayError {
 }
 
 /// Current state file format version. Bump when the format changes
-/// incompatibly. On load, if the version doesn't match, the overlay is
-/// considered stale and should be wiped.
-const STATE_VERSION: u32 = 1;
+/// incompatibly. Older versions for which we know how to migrate
+/// in-place are handled in [`migrate_v1_to_v2`].
+const STATE_VERSION: u32 = 2;
 
+/// State file schema (v2 onwards): metadata only. Whiteouts and opaque
+/// markers live on disk as `.wh.*` files in the upper directory.
 #[derive(Serialize, Deserialize)]
 struct StateFile {
-    /// Format version — reject overlays from incompatible versions.
     #[serde(default)]
     version: u32,
     env_hash: String,
@@ -103,12 +127,25 @@ struct StateFile {
     /// Used to detect incompatible overlay/transport combinations.
     #[serde(default)]
     transport: String,
+}
+
+/// V1 state file schema. Read once during migration to materialise
+/// in-tree `.wh.*` markers, then discarded. Only the fields we still
+/// care about are listed — `env_hash` and `transport` were already
+/// validated by parsing the file as the current [`StateFile`] header.
+#[derive(Deserialize)]
+struct StateFileV1 {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
     whiteouts: Vec<PathBuf>,
     #[serde(default)]
     opaque_dirs: Vec<PathBuf>,
 }
 
-/// Persistent overlay state: whiteouts, environment identity, and transport type.
+/// Persistent overlay state: in-memory cache of whiteouts/opaque
+/// directories backed by `.wh.*` markers on disk, plus environment
+/// identity and transport.
 ///
 /// Holds an exclusive file lock on `.rattler_fs_state.lock` for its entire
 /// lifetime, preventing concurrent access to the same overlay directory.
@@ -177,6 +214,10 @@ impl OverlayState {
     /// The `lock` must have been obtained via [`Self::acquire_lock`] on the same
     /// directory.  This variant exists so `create_overlay` can hold the lock
     /// across the wipe-and-retry path without a race window.
+    ///
+    /// Performs in-place migration of v1 state files (which carried
+    /// whiteouts inline as JSON) to v2 (whiteouts as on-disk `.wh.*`
+    /// markers).
     pub fn load_with_lock(
         dir: PathBuf,
         env_hash: String,
@@ -186,37 +227,37 @@ impl OverlayState {
         fs::create_dir_all(&dir)?;
         let state_path = dir.join(STATE_FILENAME);
 
-        let (whiteouts, opaque_dirs) = if state_path.exists() {
+        if state_path.exists() {
             let content = fs::read_to_string(&state_path)?;
-            let state: StateFile = serde_json::from_str(&content)?;
-            if state.version != STATE_VERSION {
-                return Err(OverlayError::VersionMismatch {
-                    expected: STATE_VERSION,
-                    found: state.version,
-                    lock,
-                });
-            }
-            if state.env_hash != env_hash {
+            let header: StateFile = serde_json::from_str(&content)?;
+            if header.env_hash != env_hash {
                 return Err(OverlayError::EnvHashMismatch {
                     expected: env_hash,
-                    found: state.env_hash,
+                    found: header.env_hash,
                     lock,
                 });
             }
-            if !state.transport.is_empty() && state.transport != transport {
+            if !header.transport.is_empty() && header.transport != transport {
                 return Err(OverlayError::TransportMismatch {
                     expected: transport,
-                    found: state.transport,
+                    found: header.transport,
                     lock,
                 });
             }
-            (
-                state.whiteouts.into_iter().collect(),
-                state.opaque_dirs.into_iter().collect(),
-            )
-        } else {
-            (HashSet::new(), HashSet::new())
-        };
+            match header.version {
+                STATE_VERSION => {}
+                1 => migrate_v1_to_v2(&dir, &content)?,
+                v => {
+                    return Err(OverlayError::VersionMismatch {
+                        expected: STATE_VERSION,
+                        found: v,
+                        lock,
+                    });
+                }
+            }
+        }
+
+        let (whiteouts, opaque_dirs) = scan_markers(&dir)?;
 
         let overlay = OverlayState {
             dir,
@@ -227,7 +268,8 @@ impl OverlayState {
             transport,
             _lock: lock,
         };
-        // Write initial state file if it didn't exist
+        // Write fresh state header (v2 metadata only) — covers both the
+        // brand-new case and the post-migration case.
         overlay.flush()?;
         Ok(overlay)
     }
@@ -237,18 +279,52 @@ impl OverlayState {
         self.whiteouts.contains(path)
     }
 
-    /// Mark a virtual path as deleted. Flushes state to disk.
+    /// Mark a virtual path as deleted.
+    ///
+    /// Creates the on-disk `.wh.{name}` marker file in the upper-layer
+    /// counterpart of `path`'s parent directory, then updates the
+    /// in-memory cache. The marker is an empty regular file — the kernel
+    /// overlayfs convention is a 0:0 char device, but those require root
+    /// privileges; userspace overlays (podman, fuse-overlayfs) use plain
+    /// files instead.
     pub fn add_whiteout(&mut self, path: PathBuf) -> Result<(), OverlayError> {
+        let marker = whiteout_marker_path(&self.dir, &path)?;
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // O_CREAT | O_TRUNC — atomic create, idempotent if the marker
+        // already exists.
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker)?;
         self.whiteouts.insert(path);
-        self.flush()
+        Ok(())
     }
 
-    /// Remove a whiteout (e.g. when recreating a deleted file). Flushes state to disk.
+    /// Remove a whiteout (e.g. when recreating a deleted file).
+    ///
+    /// Deletes the on-disk marker (no-op if missing) and updates the
+    /// in-memory cache.
     pub fn remove_whiteout(&mut self, path: &Path) -> Result<(), OverlayError> {
-        if self.whiteouts.remove(path) {
-            self.flush()?;
+        let was_present = self.whiteouts.remove(path);
+        let marker = whiteout_marker_path(&self.dir, path)?;
+        match fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Marker missing — fine if the in-memory entry was also
+                // missing (idempotent remove).
+                if was_present {
+                    tracing::debug!(
+                        "remove_whiteout: in-memory entry present but marker file missing at {}",
+                        marker.display()
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     /// Get the path in the upper layer for a given virtual path.
@@ -266,16 +342,41 @@ impl OverlayState {
         self.opaque_dirs.contains(path)
     }
 
-    /// Mark a directory as opaque. Flushes state to disk.
+    /// Mark a directory as opaque.
+    ///
+    /// Creates the `.wh..wh..opq` marker file *inside* the upper-layer
+    /// counterpart of `path`, then updates the in-memory cache.
     pub fn add_opaque_dir(&mut self, path: PathBuf) -> Result<(), OverlayError> {
+        let marker = opaque_marker_path(&self.dir, &path);
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker)?;
         self.opaque_dirs.insert(path);
-        self.flush()
+        Ok(())
     }
 
-    /// Remove opaque marker from a directory. Flushes state to disk.
+    /// Remove opaque marker from a directory.
     pub fn remove_opaque_dir(&mut self, path: &Path) -> Result<(), OverlayError> {
-        self.opaque_dirs.remove(path);
-        self.flush()
+        let was_present = self.opaque_dirs.remove(path);
+        let marker = opaque_marker_path(&self.dir, path);
+        match fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if was_present {
+                    tracing::debug!(
+                        "remove_opaque_dir: in-memory entry present but marker missing at {}",
+                        marker.display()
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The overlay directory path.
@@ -283,14 +384,53 @@ impl OverlayState {
         &self.dir
     }
 
-    /// Atomically write state to disk (write-tmp → fsync → rename).
+    /// Clean up every whiteout/opaque marker that lives directly under
+    /// `virtual_dir` in the upper layer, and the corresponding in-memory
+    /// entries.
+    ///
+    /// Used by `rmdir` to drain the marker files inside a directory
+    /// that's about to be removed (otherwise `fs::remove_dir` would fail
+    /// because the directory still contains those markers). The
+    /// to-be-removed dir's own whiteout (recorded on its *parent*) takes
+    /// over the hiding-from-the-lower-layer responsibility, so the
+    /// per-child markers become redundant.
+    pub fn clear_dir_markers(&mut self, virtual_dir: &Path) -> Result<(), OverlayError> {
+        let upper = self.upper_path(virtual_dir);
+        match fs::read_dir(&upper) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if is_marker_name(&name) {
+                        // Best-effort: ignore NotFound (race with concurrent remove).
+                        match fs::remove_file(entry.path()) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Drop the in-memory entries that lived under this dir.
+        let dir_owned = virtual_dir.to_path_buf();
+        self.whiteouts
+            .retain(|p| p.parent().map(Path::to_path_buf) != Some(dir_owned.clone()));
+        self.opaque_dirs.retain(|p| p != &dir_owned);
+        Ok(())
+    }
+
+    /// Atomically write the v2 state header (`env_hash` + `transport` +
+    /// `version`) to disk. Called on mount and on overlay-version
+    /// migration. Whiteouts are NOT written here — they live as on-disk
+    /// markers.
     pub(crate) fn flush(&self) -> Result<(), OverlayError> {
         let state = StateFile {
             version: STATE_VERSION,
             env_hash: self.env_hash.clone(),
             transport: self.transport.clone(),
-            whiteouts: self.whiteouts.iter().cloned().collect(),
-            opaque_dirs: self.opaque_dirs.iter().cloned().collect(),
         };
         let json = serde_json::to_string_pretty(&state)?;
 
@@ -301,6 +441,170 @@ impl OverlayState {
         fs::rename(&tmp_path, &self.state_path)?;
         Ok(())
     }
+}
+
+/// Translate `virtual_path` ("lib/foo.py") to the on-disk marker file
+/// path ("{upper}/lib/.wh.foo.py").
+///
+/// Returns `Err` if `virtual_path` has no file name (e.g. is empty or
+/// ends in `..`) — those paths cannot meaningfully be deleted.
+fn whiteout_marker_path(upper_dir: &Path, virtual_path: &Path) -> Result<PathBuf, OverlayError> {
+    let name = virtual_path.file_name().ok_or_else(|| {
+        OverlayError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot create whiteout for path with no file name: {}",
+                virtual_path.display()
+            ),
+        ))
+    })?;
+    let parent = virtual_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut marker_name = OsString::from(WHITEOUT_PREFIX);
+    marker_name.push(name);
+    Ok(upper_dir.join(parent).join(marker_name))
+}
+
+/// Translate `virtual_dir` ("lib/python") to the opaque marker path
+/// ("{upper}/lib/python/.wh..wh..opq").
+fn opaque_marker_path(upper_dir: &Path, virtual_dir: &Path) -> PathBuf {
+    upper_dir.join(virtual_dir).join(OPAQUE_MARKER)
+}
+
+/// Walk `upper_dir` recursively and collect any `.wh.*` markers into
+/// (`whiteouts`, `opaque_dirs`) sets.
+///
+/// `upper_dir` not existing yet is fine — returns empty sets.
+fn scan_markers(upper_dir: &Path) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>), OverlayError> {
+    let mut whiteouts = HashSet::new();
+    let mut opaques = HashSet::new();
+    if upper_dir.exists() {
+        scan_markers_recursive(upper_dir, upper_dir, &mut whiteouts, &mut opaques)?;
+    }
+    Ok((whiteouts, opaques))
+}
+
+fn scan_markers_recursive(
+    base: &Path,
+    cur: &Path,
+    whiteouts: &mut HashSet<PathBuf>,
+    opaques: &mut HashSet<PathBuf>,
+) -> Result<(), OverlayError> {
+    let entries = match fs::read_dir(cur) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_owned();
+        // Skip our own state files
+        if name == STATE_FILENAME || name == STATE_TMP_FILENAME || name == STATE_LOCK_FILENAME {
+            continue;
+        }
+
+        let relative = cur.strip_prefix(base).unwrap_or_else(|_| Path::new(""));
+        if let Some(orig) = decode_marker(&name) {
+            match orig {
+                MarkerKind::Whiteout(target) => {
+                    whiteouts.insert(relative.join(target));
+                }
+                MarkerKind::Opaque => {
+                    opaques.insert(relative.to_path_buf());
+                }
+            }
+            // Don't recurse into a marker (it's a regular file).
+            continue;
+        }
+
+        if path.is_dir() {
+            scan_markers_recursive(base, &path, whiteouts, opaques)?;
+        }
+    }
+    Ok(())
+}
+
+enum MarkerKind {
+    Whiteout(OsString),
+    Opaque,
+}
+
+/// If `name` is a whiteout marker, return the original (un-whited-out)
+/// filename; if it is an opaque marker, return [`MarkerKind::Opaque`];
+/// otherwise return `None`.
+fn decode_marker(name: &OsStr) -> Option<MarkerKind> {
+    let s = name.to_str()?;
+    if s == OPAQUE_MARKER {
+        return Some(MarkerKind::Opaque);
+    }
+    if let Some(rest) = s.strip_prefix(WHITEOUT_PREFIX) {
+        if rest.is_empty() {
+            // ".wh." with no suffix — malformed, ignore.
+            return None;
+        }
+        return Some(MarkerKind::Whiteout(OsString::from(rest)));
+    }
+    None
+}
+
+/// True if `name` is one of our internal markers (whiteout or opaque).
+/// Callers serving readdir output to clients use this to filter the
+/// upper directory.
+pub(crate) fn is_marker_name(name: &OsStr) -> bool {
+    decode_marker(name).is_some()
+}
+
+/// One-shot v1 → v2 migration.
+///
+/// Reads the v1 state file (which embedded the whiteout/opaque lists in
+/// JSON) and materialises each entry as a `.wh.*` marker in the upper
+/// directory. The state file itself is rewritten as v2 by the caller's
+/// subsequent `flush()`.
+fn migrate_v1_to_v2(upper_dir: &Path, v1_content: &str) -> Result<(), OverlayError> {
+    let v1: StateFileV1 = serde_json::from_str(v1_content)?;
+    debug_assert_eq!(v1.version, 1);
+    tracing::info!(
+        "migrating overlay state from v1 → v2 in {}: {} whiteouts, {} opaque dirs",
+        upper_dir.display(),
+        v1.whiteouts.len(),
+        v1.opaque_dirs.len(),
+    );
+    for path in v1.whiteouts {
+        let marker = whiteout_marker_path(upper_dir, &path)?;
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // create_new is intentional: if a file with the same name already
+        // exists in upper (the user did create-then-delete), the marker
+        // collision is a real conflict and the migration should error.
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&marker)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Idempotent if migration was interrupted previously.
+                tracing::debug!("migration: marker already exists at {}", marker.display());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for path in v1.opaque_dirs {
+        let marker = opaque_marker_path(upper_dir, &path);
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&marker)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -320,7 +624,7 @@ mod tests {
         let content = fs::read_to_string(dir.join(STATE_FILENAME)).unwrap();
         let parsed: StateFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.env_hash, "hash123");
-        assert!(parsed.whiteouts.is_empty());
+        assert_eq!(parsed.version, STATE_VERSION);
     }
 
     #[test]
@@ -328,10 +632,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("overlay");
 
-        // Create with one hash
         OverlayState::load(dir.clone(), "hash_a".into(), "test".into()).unwrap();
-
-        // Try to load with different hash
         let err = OverlayState::load(dir, "hash_b".into(), "test".into()).unwrap_err();
         assert!(matches!(err, OverlayError::EnvHashMismatch { .. }));
     }
@@ -350,16 +651,19 @@ mod tests {
     fn test_whiteout_add_remove() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("overlay");
-        let mut state = OverlayState::load(dir, "hash".into(), "test".into()).unwrap();
+        let mut state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
 
         let path = PathBuf::from("lib/foo.py");
         assert!(!state.is_whiteout(&path));
 
         state.add_whiteout(path.clone()).unwrap();
         assert!(state.is_whiteout(&path));
+        // Marker file present on disk
+        assert!(dir.join("lib/.wh.foo.py").exists());
 
         state.remove_whiteout(&path).unwrap();
         assert!(!state.is_whiteout(&path));
+        assert!(!dir.join("lib/.wh.foo.py").exists());
     }
 
     #[test]
@@ -367,15 +671,45 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("overlay");
 
-        // Add a whiteout
         {
             let mut state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
             state.add_whiteout(PathBuf::from("lib/deleted.py")).unwrap();
         }
 
-        // Reload and verify
         let state = OverlayState::load(dir, "hash".into(), "test".into()).unwrap();
         assert!(state.is_whiteout(Path::new("lib/deleted.py")));
+    }
+
+    #[test]
+    fn test_opaque_dir_add_remove() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("overlay");
+        let mut state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
+
+        let path = PathBuf::from("lib/python");
+        assert!(!state.is_opaque(&path));
+
+        state.add_opaque_dir(path.clone()).unwrap();
+        assert!(state.is_opaque(&path));
+        assert!(dir.join("lib/python/.wh..wh..opq").exists());
+
+        state.remove_opaque_dir(&path).unwrap();
+        assert!(!state.is_opaque(&path));
+        assert!(!dir.join("lib/python/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn test_opaque_persists_across_reload() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("overlay");
+
+        {
+            let mut state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
+            state.add_opaque_dir(PathBuf::from("lib/python")).unwrap();
+        }
+
+        let state = OverlayState::load(dir, "hash".into(), "test".into()).unwrap();
+        assert!(state.is_opaque(Path::new("lib/python")));
     }
 
     #[test]
@@ -398,7 +732,6 @@ mod tests {
 
         assert!(!state.has_upper(Path::new("lib/foo.py")));
 
-        // Create the file in upper
         fs::create_dir_all(dir.join("lib")).unwrap();
         fs::write(dir.join("lib/foo.py"), b"content").unwrap();
 
@@ -406,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_produces_valid_json() {
+    fn test_flush_produces_metadata_only_json() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("overlay");
         let mut state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
@@ -414,10 +747,130 @@ mod tests {
         state.add_whiteout(PathBuf::from("a/b.py")).unwrap();
         state.add_whiteout(PathBuf::from("c/d.py")).unwrap();
 
-        // Read and verify the state file is valid JSON
+        // The state file is metadata only; whiteouts are out-of-band markers.
         let content = fs::read_to_string(dir.join(STATE_FILENAME)).unwrap();
+        assert!(!content.contains("whiteouts"));
+        assert!(!content.contains("opaque_dirs"));
         let parsed: StateFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.env_hash, "hash");
-        assert_eq!(parsed.whiteouts.len(), 2);
+        assert_eq!(parsed.version, STATE_VERSION);
+
+        // Markers are on disk.
+        assert!(dir.join("a/.wh.b.py").exists());
+        assert!(dir.join("c/.wh.d.py").exists());
+    }
+
+    #[test]
+    fn test_v1_state_file_migrates() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("overlay");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write a v1 state file by hand.
+        let v1 = serde_json::json!({
+            "version": 1,
+            "env_hash": "hash",
+            "transport": "test",
+            "whiteouts": ["lib/python/foo.py", "bin/oldscript"],
+            "opaque_dirs": ["lib/etc"],
+        });
+        fs::write(
+            dir.join(STATE_FILENAME),
+            serde_json::to_string_pretty(&v1).unwrap(),
+        )
+        .unwrap();
+
+        // Loading should migrate.
+        let state = OverlayState::load(dir.clone(), "hash".into(), "test".into()).unwrap();
+        assert!(state.is_whiteout(Path::new("lib/python/foo.py")));
+        assert!(state.is_whiteout(Path::new("bin/oldscript")));
+        assert!(state.is_opaque(Path::new("lib/etc")));
+
+        // The state file is now v2 and contains no inline whiteouts.
+        let content = fs::read_to_string(dir.join(STATE_FILENAME)).unwrap();
+        assert!(!content.contains("whiteouts"));
+        assert!(!content.contains("opaque_dirs"));
+        let parsed: StateFile = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.version, STATE_VERSION);
+
+        // Markers are on disk.
+        assert!(dir.join("lib/python/.wh.foo.py").exists());
+        assert!(dir.join("bin/.wh.oldscript").exists());
+        assert!(dir.join("lib/etc/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn test_unknown_future_version_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("overlay");
+        fs::create_dir_all(&dir).unwrap();
+        let v999 = serde_json::json!({
+            "version": 999,
+            "env_hash": "hash",
+            "transport": "test",
+        });
+        fs::write(
+            dir.join(STATE_FILENAME),
+            serde_json::to_string_pretty(&v999).unwrap(),
+        )
+        .unwrap();
+        let err = OverlayState::load(dir, "hash".into(), "test".into()).unwrap_err();
+        assert!(matches!(
+            err,
+            OverlayError::VersionMismatch { found: 999, .. }
+        ));
+    }
+
+    #[test]
+    fn test_whiteout_marker_path_components() {
+        let dir = PathBuf::from("/upper");
+        assert_eq!(
+            whiteout_marker_path(&dir, Path::new("lib/foo.py")).unwrap(),
+            PathBuf::from("/upper/lib/.wh.foo.py")
+        );
+        assert_eq!(
+            whiteout_marker_path(&dir, Path::new("foo")).unwrap(),
+            PathBuf::from("/upper/.wh.foo")
+        );
+    }
+
+    #[test]
+    fn test_decode_marker() {
+        assert!(matches!(
+            decode_marker(OsStr::new(".wh.foo")),
+            Some(MarkerKind::Whiteout(_))
+        ));
+        assert!(matches!(
+            decode_marker(OsStr::new(".wh..wh..opq")),
+            Some(MarkerKind::Opaque)
+        ));
+        assert!(decode_marker(OsStr::new("foo")).is_none());
+        assert!(decode_marker(OsStr::new(".wh.")).is_none());
+    }
+
+    #[test]
+    fn test_is_marker_name() {
+        assert!(is_marker_name(OsStr::new(".wh.foo")));
+        assert!(is_marker_name(OsStr::new(".wh..wh..opq")));
+        assert!(!is_marker_name(OsStr::new("regular_file")));
+    }
+
+    #[test]
+    fn test_scan_markers_finds_existing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("overlay");
+        fs::create_dir_all(dir.join("lib/python")).unwrap();
+        fs::create_dir_all(dir.join("etc")).unwrap();
+        fs::write(dir.join("lib/python/.wh.foo.py"), b"").unwrap();
+        fs::write(dir.join(".wh.toplevel"), b"").unwrap();
+        fs::write(dir.join("etc/.wh..wh..opq"), b"").unwrap();
+        fs::write(dir.join("regular.txt"), b"hi").unwrap();
+
+        let (wos, opqs) = scan_markers(&dir).unwrap();
+        assert!(wos.contains(Path::new("lib/python/foo.py")));
+        assert!(wos.contains(Path::new("toplevel")));
+        assert!(opqs.contains(Path::new("etc")));
+        assert_eq!(wos.len(), 2);
+        assert_eq!(opqs.len(), 1);
     }
 }
