@@ -82,9 +82,7 @@ impl<T> MutexExt<T> for Mutex<T> {
 
 mod inode;
 
-use crate::overlay::{
-    is_marker_name, OverlayState, STATE_FILENAME, STATE_LOCK_FILENAME, STATE_TMP_FILENAME,
-};
+use crate::overlay::{is_overlay_internal_name, OverlayState, COW_TMP_PREFIX};
 use crate::vfs_ops::{set_file_permissions, ContentSource, DirEntry, FileAttr, FileKind, VfsOps};
 use inode::{ResolvedIno, UpperInodeMap, UPPER_INODE_BASE};
 
@@ -159,15 +157,10 @@ impl<T: VfsOps> OverlayFS<T> {
             let path = entry.path();
             let name = path.file_name().unwrap_or_default();
 
-            // Skip overlay internal files
-            if name == STATE_FILENAME || name == STATE_TMP_FILENAME || name == STATE_LOCK_FILENAME {
-                continue;
-            }
-
-            // Whiteout / opaque markers are bookkeeping, not user files —
-            // OverlayState already discovered them; they must NOT receive
-            // inodes (or they'd surface in readdir).
-            if is_marker_name(name) {
+            // Skip every kind of overlay-internal entry: state files,
+            // whiteout/opaque markers, in-flight COW temp files. None of
+            // these should receive inodes or appear in readdir output.
+            if is_overlay_internal_name(name) {
                 continue;
             }
 
@@ -187,6 +180,32 @@ impl<T: VfsOps> OverlayFS<T> {
 
     fn assign_upper_ino(&self, virtual_path: PathBuf) -> Result<u64, i32> {
         Ok(self.upper_inodes.lock_or_eio()?.get_or_assign(virtual_path))
+    }
+
+    /// Drop any cached lookup state for `virtual_path` after a destructive
+    /// operation (unlink / rmdir / rename source).
+    ///
+    /// - `lower_ino_cache`: removes the path entry. The lower layer is
+    ///   read-only so the cached value isn't *wrong*; the entry is just
+    ///   no longer reachable through the user's view, and clearing it
+    ///   prevents subsequent code paths from acting on stale truth.
+    /// - `promoted`: removes the lower→upper redirect. After unlinking a
+    ///   COW'd file, any kernel handle still pointing at the original
+    ///   lower inode would otherwise resolve to the now-gone upper inode
+    ///   ([`Self::resolve_ino`] would happily return `Upper(path)` for
+    ///   a path that no longer exists on disk).
+    fn invalidate_path_caches(&self, virtual_path: &Path) -> Result<(), i32> {
+        // Look up the lower ino BEFORE removing the cache entry so we
+        // know which `promoted` key to drop. The lookup may re-populate
+        // the cache, but we erase it again immediately after.
+        let lower_ino = self.lower_ino_for_path(virtual_path);
+        if let Some(mut cache) = self.lower_ino_cache.lock_or_none() {
+            cache.remove(virtual_path);
+        }
+        if let Some(lower_ino) = lower_ino {
+            self.promoted.lock_or_eio()?.remove(&lower_ino);
+        }
+        Ok(())
     }
 
     /// Get the on-disk upper layer path for a virtual path (no lock needed).
@@ -313,6 +332,9 @@ impl<T: VfsOps> OverlayFS<T> {
 
         // Use symlink_metadata so existing symlinks (which dereferencing
         // exists() would follow) are recognised as already-promoted.
+        // Because each COW lands atomically (write-temp → fsync → rename),
+        // presence of `upper_path` implies a complete file — no half-written
+        // remnant from a crashed earlier COW can reach this branch.
         if fs::symlink_metadata(&upper_path).is_ok() {
             return Ok(upper_path);
         }
@@ -325,6 +347,7 @@ impl<T: VfsOps> OverlayFS<T> {
                     return self.copy_dir_to_upper(virtual_path, lower_ino);
                 }
                 FileKind::Symlink => {
+                    // symlink(2) is atomic at the kernel — no temp+rename dance.
                     let target = self.lower.readlink(lower_ino)?;
                     create_symlink(&target, &upper_path).map_err(|e| {
                         tracing::warn!(
@@ -341,18 +364,54 @@ impl<T: VfsOps> OverlayFS<T> {
             }
         }
 
-        if let Ok(ContentSource::Direct(source)) = self.lower.content_source(lower_ino) {
-            reflink_copy::reflink_or_copy(&source, &upper_path).map_err(|e| {
-                tracing::warn!("COW copy failed {:?} -> {:?}: {}", source, upper_path, e);
+        // Atomic regular-file COW: write to a sibling temp file, fsync,
+        // then rename. A crash between steps leaves either the temp file
+        // (which scan_upper / readdir filter out) or the final file fully
+        // populated — never a half-written `upper_path`.
+        let tmp_path = cow_tmp_path(&upper_path);
+        let res = (|| -> Result<(), i32> {
+            if let Ok(ContentSource::Direct(source)) = self.lower.content_source(lower_ino) {
+                reflink_copy::reflink_or_copy(&source, &tmp_path).map_err(|e| {
+                    tracing::warn!(
+                        "COW reflink/copy failed {:?} -> {:?}: {}",
+                        source,
+                        tmp_path,
+                        e
+                    );
+                    EIO
+                })?;
+            } else {
+                // Transformed or Virtual — read all content via the VFS.
+                let data = self.lower.read(lower_ino, 0, u32::MAX)?;
+                let mut f = File::create(&tmp_path).map_err(|e| {
+                    tracing::warn!("COW tmp create failed {:?}: {}", tmp_path, e);
+                    EIO
+                })?;
+                f.write_all(&data).map_err(|e| {
+                    tracing::warn!("COW tmp write failed {:?}: {}", tmp_path, e);
+                    EIO
+                })?;
+                f.sync_all().map_err(|e| {
+                    tracing::warn!("COW tmp fsync failed {:?}: {}", tmp_path, e);
+                    EIO
+                })?;
+            }
+            fs::rename(&tmp_path, &upper_path).map_err(|e| {
+                tracing::warn!(
+                    "COW tmp rename failed {:?} -> {:?}: {}",
+                    tmp_path,
+                    upper_path,
+                    e
+                );
                 EIO
-            })?;
-        } else {
-            // Transformed or Virtual — read all content via the VFS
-            let data = self.lower.read(lower_ino, 0, u32::MAX)?;
-            fs::write(&upper_path, &data).map_err(|e| {
-                tracing::warn!("COW write failed {:?}: {}", upper_path, e);
-                EIO
-            })?;
+            })
+        })();
+        if let Err(e) = res {
+            // Best-effort cleanup of the temp file. If this fails, the
+            // next mount's scan_upper will also ignore it (filtered out
+            // as a COW temp), so we just leak the inode.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
         Ok(upper_path)
     }
@@ -384,6 +443,21 @@ impl<T: VfsOps> OverlayFS<T> {
 
         Ok(upper_path)
     }
+}
+
+/// Build a unique temp-file path next to `final_path` for atomic COW.
+/// The temp lives in the same directory (so `rename(2)` is atomic) and
+/// uses [`COW_TMP_PREFIX`] so [`is_overlay_internal_name`] filters it
+/// from readdir / inode assignment if a crash leaves it behind.
+fn cow_tmp_path(final_path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let parent = final_path.parent().unwrap_or_else(|| Path::new(""));
+    let name = final_path.file_name().unwrap_or_default();
+    let mut tmp_name = OsString::from(COW_TMP_PREFIX);
+    tmp_name.push(format!("{}.{}.", std::process::id(), counter));
+    tmp_name.push(name);
+    parent.join(tmp_name)
 }
 
 /// Reject names that would let a request escape the overlay root or refer
@@ -648,11 +722,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         if let Ok(read_dir) = fs::read_dir(&upper_dir) {
             for entry in read_dir.flatten() {
                 let name = entry.file_name();
-                if name == STATE_FILENAME
-                    || name == STATE_LOCK_FILENAME
-                    || name.to_str().is_some_and(|s| s.ends_with(".tmp"))
-                    || is_marker_name(&name)
-                {
+                if is_overlay_internal_name(&name) {
                     continue;
                 }
                 let child_path = dir_path.join(&name);
@@ -825,9 +895,14 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         if self.lower_ino_for_path(&virtual_path).is_some() {
             self.state
                 .lock_or_eio()?
-                .add_whiteout(virtual_path)
+                .add_whiteout(virtual_path.clone())
                 .map_err(|_e| EIO)?;
         }
+
+        // Invalidate any cached lower→ino mapping and promoted redirect
+        // for this path — without this, a kernel handle for the removed
+        // file could keep resolving via the stale promoted entry.
+        self.invalidate_path_caches(&virtual_path)?;
 
         Ok(())
     }
@@ -901,9 +976,12 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         if self.lower_ino_for_path(&virtual_path).is_some() {
             self.state
                 .lock_or_eio()?
-                .add_whiteout(virtual_path)
+                .add_whiteout(virtual_path.clone())
                 .map_err(|_e| EIO)?;
         }
+
+        // Mirror unlink: drop cached state for the removed directory.
+        self.invalidate_path_caches(&virtual_path)?;
 
         Ok(())
     }
@@ -1018,6 +1096,10 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 .lock_or_eio()?
                 .rename_path(&src_path, dst_path);
         }
+
+        // Drop cached lower→ino mapping for the source path (it now
+        // points nowhere from the user's view) and any promoted redirect.
+        self.invalidate_path_caches(&src_path)?;
         Ok(())
     }
 

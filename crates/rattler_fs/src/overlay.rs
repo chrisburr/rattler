@@ -553,6 +553,27 @@ pub(crate) fn is_marker_name(name: &OsStr) -> bool {
     decode_marker(name).is_some()
 }
 
+/// Filename prefix for atomic-COW temporary files. A file with this
+/// prefix is in flight from a copy-then-rename — never expose to clients
+/// and never assign an inode.
+pub(crate) const COW_TMP_PREFIX: &str = ".rfs.tmp.";
+
+/// True if `name` is a COW temp file produced by [`cow_tmp_path`].
+pub(crate) fn is_cow_tmp_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|s| s.starts_with(COW_TMP_PREFIX))
+}
+
+/// True if `name` is any kind of overlay-internal entry (state files,
+/// whiteout/opaque markers, or in-flight COW temp files). Callers serving
+/// readdir output and the scan-for-inodes pass use this single helper.
+pub(crate) fn is_overlay_internal_name(name: &OsStr) -> bool {
+    name == STATE_FILENAME
+        || name == STATE_TMP_FILENAME
+        || name == STATE_LOCK_FILENAME
+        || is_marker_name(name)
+        || is_cow_tmp_name(name)
+}
+
 /// One-shot v1 → v2 migration.
 ///
 /// Reads the v1 state file (which embedded the whiteout/opaque lists in
