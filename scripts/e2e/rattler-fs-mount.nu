@@ -337,8 +337,22 @@ if $use_overlay {
             ^$python_path -m pip uninstall -y pytest
         }))
 
+        # Diagnostic: show what's at site-packages/pytest after pip uninstall
+        let pytest_dir = $"($mount_point)/lib/python3.12/site-packages/pytest"
+        if ($pytest_dir | path exists) {
+            print $"  DIAG: ($pytest_dir) still exists"
+            try {
+                let entries = (ls $pytest_dir | get name)
+                print $"  DIAG: pytest/ entries: ($entries)"
+            } catch { |err|
+                print $"  DIAG: pytest/ ls error: ($err.msg)"
+            }
+        } else {
+            print $"  DIAG: ($pytest_dir) does not exist"
+        }
+
         $results = ($results | append (expect_fail "import pytest after uninstall" {
-            ^$python_path -c "import pytest"
+            ^$python_path -c "import pytest; print('pytest.__file__=', pytest.__file__); print('pytest.__path__=', list(pytest.__path__))"
         }))
     }
 
