@@ -540,12 +540,18 @@ if $nu.os-info.name != "windows" {
 
 # NFS stale mount: SIGKILL the process (no cleanup), verify force-unmount works.
 # NFS-only — FUSE auto-unmounts when the FUSE fd is closed.
+#
 # Linux is excluded: GHA Linux runners' NFS client wedges after several
 # mount/umount cycles in this script (umount.nfs returns EPERM under sudo
 # even though `umount -i` should bypass it), and a subsequent mount on a
-# fresh path then hangs uninterruptibly. macOS NFS already exercises this
-# code path successfully — that's the platform whose unmount-on-stale
-# behavior we actually ship to users.
+# fresh path then hangs uninterruptibly. The same script runs cleanly on
+# Linux outside GHA (locally and on self-hosted runners with privileged
+# NFS support) — this is a runner-image limitation, not a code issue.
+#
+# macOS NFS already exercises this code path successfully — that's the
+# platform whose unmount-on-stale behavior we actually ship to users.
+# Moving Linux NFS coverage to a self-hosted or container runner with
+# proper privilege isolation is tracked as out-of-scope follow-up work.
 if $transport == "nfs" and $nu.os-info.name != "linux" {
     print "\n== NFS stale mount test"
 

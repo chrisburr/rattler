@@ -14,6 +14,17 @@ use memchr::memmem;
 /// positions of each placeholder occurrence.
 ///
 /// Returns the bytes in the output range `[start, end)`.
+///
+/// # Single-shot contract
+///
+/// This function computes a ranged read end-to-end in one call. It tracks
+/// `src_pos` (input cursor) and `out_pos` (output cursor) independently,
+/// and may return early once `buffer` reaches capacity — at that point
+/// `src_pos` may still point at the start of an in-progress placeholder
+/// expansion, which is fine because the function returns and the local
+/// state is discarded. Do not adapt this function to be re-entered with
+/// shared cursor state across calls; callers issue one ranged read per
+/// FUSE/NFS request and the function fully satisfies it.
 pub fn text_ranged_read(
     source: &[u8],
     old_prefix: &[u8],

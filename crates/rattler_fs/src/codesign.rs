@@ -127,7 +127,24 @@ fn find_code_signature(macho: &[u8]) -> Result<(u32, u32), CodesignError> {
     Err(CodesignError::NoCodeSignature)
 }
 
-/// Parse a `SuperBlob`, return the offset of the `CodeDirectory` blob within it.
+/// Parse a `SuperBlob`, return the offset of the *first* `CodeDirectory`
+/// blob within it.
+///
+/// # Limitation: dual-CD signatures
+///
+/// Real-world Mach-O binaries can ship multiple alternate `CodeDirectory`
+/// blobs (e.g. SHA-1 + SHA-256) — typical for Developer-ID-signed binaries
+/// produced before SHA-1 was deprecated. This function returns the first
+/// CD it finds, so a binary whose SHA-1 CD comes first would error in
+/// [`resign_macho_slice`] with `UnsupportedHashType(1)`, and a binary
+/// where SHA-256 comes first would leave the SHA-1 alternate stale after
+/// re-signing.
+///
+/// **This is unreachable for conda packages** because conda packages are
+/// either unsigned or ad-hoc signed (single SHA-256 CD); we re-sign with
+/// the same single-CD ad-hoc shape. Adding dual-CD support would require
+/// iterating all CDs, hashing each with its declared algorithm, and
+/// preferring SHA-256 — tracked as follow-up.
 fn find_code_directory(superblob: &[u8]) -> Result<usize, CodesignError> {
     if superblob.len() < 12 {
         return Err(CodesignError::InvalidSuperBlob);

@@ -210,9 +210,13 @@ pub struct PrefixPlaceholder {
     /// including the trailing newline) for text files whose first line
     /// is a shebang containing the placeholder prefix.
     ///
-    /// Used to compute the exact post-replacement file size without
-    /// re-rendering the whole file. `None` for binary-mode placeholders,
-    /// files without a shebang, or older packages.
+    /// Reserved for shebang-aware text replacement: when a producer
+    /// populates this field, a consumer can compute the exact
+    /// post-replacement file size (or apply different replacement rules
+    /// to the shebang region) without re-rendering the whole file. No
+    /// consumer in this repository reads the field today — producers
+    /// MAY emit it; consumers MUST tolerate `None` (for binary-mode
+    /// placeholders, files without a shebang, and older packages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shebang_length: Option<usize>,
 }
@@ -266,6 +270,16 @@ pub struct PathsEntry {
 ///
 /// The two representations are self-describing in JSON: a flat array of
 /// numbers vs. an array of arrays.
+///
+/// # Wire-format invariants
+///
+/// Producers MUST NOT emit empty arrays at any nesting level. The
+/// "no replacements at all" case is represented by omitting the
+/// `offsets` field on the parent [`PrefixPlaceholder`] (i.e.
+/// `offsets: None`). This is necessary because `serde(untagged)`
+/// resolves `[]` greedily as `Text(vec![])` — a binary-mode publisher
+/// emitting `[]` would silently mis-deserialize. In binary mode every
+/// inner group MUST contain at least the NUL-terminator position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(untagged)]
 pub enum Offsets {
