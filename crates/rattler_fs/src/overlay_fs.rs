@@ -125,6 +125,15 @@ impl<T: VfsOps> OverlayFS<T> {
     }
 
     fn resolve_path(&self, parent: u64, name: &OsStr) -> Result<PathBuf, i32> {
+        // Reject path-traversal components. FUSE is protected by libfuse,
+        // which strips these before reaching user code; NFS is not — wire
+        // bytes flow through `os_str_from_nfs_bytes` unchanged. Without this
+        // gate, `Path::join("..")` does not collapse and `upper_path` would
+        // resolve outside the overlay root via `fs::create_dir_all` /
+        // `fs::write`.
+        if !is_safe_component(name) {
+            return Err(libc::EINVAL);
+        }
         let parent_path = match self.resolve_ino(parent)? {
             ResolvedIno::Upper(p) | ResolvedIno::Lower(_, p) => p,
         };
@@ -231,14 +240,33 @@ impl<T: VfsOps> OverlayFS<T> {
         self.ensure_upper_parent(virtual_path)?;
         let upper_path = self.upper_path(virtual_path);
 
-        if upper_path.exists() {
+        // Use symlink_metadata so existing symlinks (which dereferencing
+        // exists() would follow) are recognised as already-promoted.
+        if fs::symlink_metadata(&upper_path).is_ok() {
             return Ok(upper_path);
         }
 
-        // Check if this is a directory — directories need recursive COW
+        // Dispatch on the lower kind. Directories need recursive COW;
+        // symlinks must be re-created as symlinks (not dereferenced).
         if let Ok(attr) = self.lower.getattr(lower_ino) {
-            if attr.kind == FileKind::Directory {
-                return self.copy_dir_to_upper(virtual_path, lower_ino);
+            match attr.kind {
+                FileKind::Directory => {
+                    return self.copy_dir_to_upper(virtual_path, lower_ino);
+                }
+                FileKind::Symlink => {
+                    let target = self.lower.readlink(lower_ino)?;
+                    create_symlink(&target, &upper_path).map_err(|e| {
+                        tracing::warn!(
+                            "COW symlink failed {:?} -> {:?}: {}",
+                            target,
+                            upper_path,
+                            e
+                        );
+                        EIO
+                    })?;
+                    return Ok(upper_path);
+                }
+                FileKind::RegularFile => {}
             }
         }
 
@@ -284,6 +312,56 @@ impl<T: VfsOps> OverlayFS<T> {
         }
 
         Ok(upper_path)
+    }
+}
+
+/// Reject names that would let a request escape the overlay root or refer
+/// to the parent directory. Empty names, ".", "..", and any name containing
+/// a path separator are unsafe — `Path::join` does not collapse "..", so
+/// `overlay_dir.join("foo/../../etc/passwd")` would resolve outside.
+fn is_safe_component(name: &OsStr) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if name.as_bytes().contains(&b'/') {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let s = match name.to_str() {
+            Some(s) => s,
+            None => return false,
+        };
+        if s.contains('/') || s.contains('\\') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Create a symlink at `dest` pointing to `target`, picking the right
+/// platform call. On Windows we use `symlink_file` (matching how rattler
+/// itself handles non-directory symlinks) — overlay COW for directory
+/// symlinks would need a kind probe; conda packages don't ship those.
+fn create_symlink(target: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, dest)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, dest)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink unsupported on this platform",
+        ))
     }
 }
 
@@ -2270,6 +2348,127 @@ mod tests {
         let state = ofs.state.lock().unwrap();
         assert!(state.is_whiteout(Path::new("lib/python/foo.py")));
         assert!(state.is_whiteout(Path::new("lib/python/bar.py")));
+    }
+
+    // --- Symlink COW regression test ---
+
+    /// Mock with a single lower symlink at /link -> "target/path".
+    struct MockLowerWithSymlink;
+    impl VfsOps for MockLowerWithSymlink {
+        fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, i32> {
+            match (parent, name.to_str().unwrap()) {
+                (1, "link") => Ok(FileAttr {
+                    ino: 2,
+                    size: 11, // length of "target/path"
+                    blocks: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    kind: FileKind::Symlink,
+                    perm: 0o777,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                }),
+                _ => Err(ENOENT),
+            }
+        }
+        fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
+            match ino {
+                1 => Ok(FileAttr {
+                    ino: 1,
+                    size: 0,
+                    blocks: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    kind: FileKind::Directory,
+                    perm: 0o755,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                }),
+                2 => Ok(FileAttr {
+                    ino: 2,
+                    size: 11,
+                    blocks: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    kind: FileKind::Symlink,
+                    perm: 0o777,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                }),
+                _ => Err(ENOENT),
+            }
+        }
+        fn readlink(&self, ino: u64) -> Result<PathBuf, i32> {
+            if ino == 2 {
+                Ok(PathBuf::from("target/path"))
+            } else {
+                Err(ENOENT)
+            }
+        }
+        fn read(&self, _ino: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, i32> {
+            Err(EIO)
+        }
+        fn content_source(&self, _ino: u64) -> Result<ContentSource, i32> {
+            Err(ENOENT)
+        }
+        fn readdir(&self, ino: u64, _offset: u64) -> Result<Vec<DirEntry>, i32> {
+            if ino == 1 {
+                Ok(vec![DirEntry {
+                    ino: 2,
+                    kind: FileKind::Symlink,
+                    name: "link".into(),
+                }])
+            } else {
+                Err(ENOENT)
+            }
+        }
+        fn ino_to_path(&self, ino: u64) -> Result<PathBuf, i32> {
+            match ino {
+                1 => Ok(PathBuf::new()),
+                2 => Ok(PathBuf::from("link")),
+                _ => Err(ENOENT),
+            }
+        }
+    }
+
+    /// Renaming a lower-layer symlink must promote it as a symlink, not as a
+    /// regular file containing the target's bytes. Otherwise readlink at the
+    /// upper path returns EIO.
+    #[cfg(unix)]
+    #[test]
+    fn test_rename_lower_symlink_preserves_kind() {
+        let tmp = TempDir::new().unwrap();
+        let overlay_dir = tmp.path().join("upper");
+        let ofs = OverlayFS::new(
+            MockLowerWithSymlink,
+            overlay_dir.clone(),
+            "hash".into(),
+            "test".into(),
+        )
+        .unwrap();
+
+        ofs.rename(1, OsStr::new("link"), 1, OsStr::new("moved"), 0)
+            .unwrap();
+
+        // The upper-layer file at "moved" must be a symlink, not a regular
+        // file. Direct fs check — bypasses the VFS read path so the test
+        // catches a mis-promoted regular file even if VFS hides it.
+        let upper_moved = overlay_dir.join("moved");
+        let meta =
+            std::fs::symlink_metadata(&upper_moved).expect("upper path should exist after rename");
+        assert!(
+            meta.file_type().is_symlink(),
+            "promoted symlink degraded to {:?} — readlink would return EIO",
+            meta.file_type()
+        );
+        let target = std::fs::read_link(&upper_moved).unwrap();
+        assert_eq!(target, PathBuf::from("target/path"));
     }
 
     // --- B1/B2 regression tests: state validation is decoupled from VFS consumption ---

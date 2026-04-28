@@ -858,10 +858,13 @@ pub fn copy_and_replace_textual_placeholder_offsets(
     let old_prefix = prefix_placeholder.as_bytes();
     let new_prefix = target_prefix.as_bytes();
 
-    // check if we have a shebang. We need to handle it differently because it has a maximum length
-    // that can be exceeded in very long target prefix's.
+    // Offsets from paths.json are absolute relative to the original file.
+    // When we strip the shebang line below we shift the slice, so offsets
+    // need to be rebased onto the post-shebang slice. Offsets that fall
+    // inside the shebang region are dropped: the shebang rewriter already
+    // handled the placeholder there.
+    let mut shebang_consumed = 0usize;
     if target_platform.is_unix() && source_bytes.starts_with(b"#!") {
-        // extract first line
         let (first, rest) =
             source_bytes.split_at(source_bytes.iter().position(|&c| c == b'\n').unwrap_or(0));
         let first_line = String::from_utf8_lossy(first);
@@ -870,17 +873,21 @@ pub fn copy_and_replace_textual_placeholder_offsets(
             (prefix_placeholder, target_prefix),
             target_platform,
         );
-        // let replaced = first_line.replace(prefix_placeholder, target_prefix);
         destination.write_all(new_shebang.as_bytes())?;
+        shebang_consumed = first.len();
         source_bytes = rest;
     }
 
     let mut last_match = 0;
 
     for &offset in offsets {
-        destination.write_all(&source_bytes[last_match..offset])?;
+        if offset < shebang_consumed {
+            continue;
+        }
+        let local = offset - shebang_consumed;
+        destination.write_all(&source_bytes[last_match..local])?;
         destination.write_all(new_prefix)?;
-        last_match = offset + old_prefix.len();
+        last_match = local + old_prefix.len();
     }
 
     // Write remaining bytes
@@ -1643,6 +1650,42 @@ mod test {
         assert_eq!(out.len(), input.len());
     }
 
+    /// Regression: when a c-string runs to EOF without a real NUL terminator,
+    /// `collect_binary_offsets` synthesises `nul_pos = source.len()`. The
+    /// padding-zero block then occupies the would-be source bytes, so output
+    /// length still equals input length. Pin this invariant down so future
+    /// changes don't accidentally break it.
+    #[test]
+    fn test_cstring_placeholder_offsets_no_nul_at_eof() {
+        // Placeholder-only at EOF.
+        let mut output = Cursor::new(Vec::new());
+        super::copy_and_replace_cstring_placeholder_offsets(
+            b"ABCD",
+            &mut output,
+            "ABCD",
+            "XY",
+            &[vec![0, 4]],
+        )
+        .unwrap();
+        let out = output.into_inner();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out, b"XY\x00\x00");
+
+        // Placeholder + trailing bytes, no NUL.
+        let mut output = Cursor::new(Vec::new());
+        super::copy_and_replace_cstring_placeholder_offsets(
+            b"ABCDMN",
+            &mut output,
+            "ABCD",
+            "Z",
+            &[vec![0, 6]],
+        )
+        .unwrap();
+        let out = output.into_inner();
+        assert_eq!(out.len(), 6);
+        assert_eq!(out, b"ZMN\x00\x00\x00");
+    }
+
     #[test]
     fn test_replace_long_prefix_in_text_file_offsets() {
         let test_data_dir =
@@ -1655,7 +1698,10 @@ mod test {
         }
         let input = fs::read(test_file).unwrap();
 
-        let offsets: Vec<usize> = Vec::new();
+        // The placeholder appears only inside the shebang line (byte 2).
+        // The shebang rewriter handles it; the loop below should skip
+        // offsets that fall inside the shebang region.
+        let offsets: Vec<usize> = vec![2];
 
         let mut output = Cursor::new(Vec::new());
         super::copy_and_replace_textual_placeholder_offsets(
@@ -1671,5 +1717,69 @@ mod test {
         let output = output.into_inner();
         let replaced = String::from_utf8_lossy(&output);
         insta::assert_snapshot!(replaced);
+    }
+
+    /// Regression test: offsets are file-absolute, but the shebang rewriter
+    /// strips the first line before the offset loop runs. Without rebasing
+    /// the offsets onto the post-shebang slice, the loop either panics
+    /// out-of-bounds or writes the wrong bytes.
+    #[test]
+    fn test_offsets_after_shebang_are_rebased() {
+        // Shebang at bytes 0..28 (newline at 27, so shebang_consumed = 27).
+        // Body placeholders at byte 28 (right after newline) and byte 50.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"#!/this/is/placeholder/python\n"); // 0..30
+        input.extend_from_slice(b"echo /this/is/placeholder\n"); // 30..56
+        input.extend_from_slice(b"echo /this/is/placeholder/lib\n"); // 56..86
+
+        let prefix_placeholder = "/this/is/placeholder";
+        let target_prefix = "/short";
+
+        // Offsets emitted by paths.json are file-absolute.
+        let offsets: Vec<usize> = vec![
+            2,  // inside shebang — should be skipped (rewriter handles it)
+            35, // body, after shebang
+            61, // body, after shebang
+        ];
+
+        let mut output = Cursor::new(Vec::new());
+        super::copy_and_replace_textual_placeholder_offsets(
+            &input,
+            &mut output,
+            prefix_placeholder,
+            target_prefix,
+            &Platform::Linux64,
+            &offsets,
+        )
+        .unwrap();
+
+        let result = output.into_inner();
+        let result_str = String::from_utf8_lossy(&result);
+        // Shebang rewritten, body placeholders replaced.
+        assert_eq!(
+            result_str,
+            "#!/short/python\necho /short\necho /short/lib\n"
+        );
+    }
+
+    /// Regression test: when the file has no shebang, offsets should be used
+    /// as-is — verifies the `shebang_consumed=0` path stays correct.
+    #[test]
+    fn test_offsets_without_shebang() {
+        let input = b"hello /this/is/placeholder world\n";
+        let offsets: Vec<usize> = vec![6];
+
+        let mut output = Cursor::new(Vec::new());
+        super::copy_and_replace_textual_placeholder_offsets(
+            input,
+            &mut output,
+            "/this/is/placeholder",
+            "/short",
+            &Platform::Linux64,
+            &offsets,
+        )
+        .unwrap();
+
+        assert_eq!(output.into_inner(), b"hello /short world\n");
     }
 }

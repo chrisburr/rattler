@@ -97,6 +97,25 @@ impl VirtualFS {
                 }
             };
 
+            // Defense-in-depth: paths.json should always pair `file_mode` with
+            // a matching `Offsets` shape, but the install-side check at
+            // `link.rs::copy_and_replace_placeholders_with_offsets` returns
+            // `InvalidData` on mismatch. Mirror that here — if shapes
+            // disagree, skip the entry so the file serves as raw cache bytes
+            // rather than mis-dispatching to the wrong ranged read.
+            match (placeholder.file_mode, &offsets) {
+                (FileMode::Text, Offsets::Text(_)) | (FileMode::Binary, Offsets::Binary(_)) => {}
+                (mode, other) => {
+                    tracing::warn!(
+                        "paths.json shape mismatch for {}: file_mode={:?}, offsets variant does not match ({:?}); serving raw cache bytes",
+                        cache_path.display(),
+                        mode,
+                        std::mem::discriminant(other),
+                    );
+                    continue;
+                }
+            }
+
             // For text-mode files, compute post-replacement size from arithmetic:
             // each replacement changes length by (new_prefix - old_prefix) bytes
             if let Offsets::Text(ref text_offsets) = offsets {

@@ -586,4 +586,24 @@ mod tests {
             vec![vec![0, 6], vec![7, 13]]
         );
     }
+
+    /// Regression: when a c-string runs to EOF without a real NUL,
+    /// `collect_binary_offsets` synthesises `nul_pos = source.len()`. The
+    /// padding-zero block then takes the place of the would-be source bytes,
+    /// so output length still equals input length. Any change that skips
+    /// padding for EOF c-strings would break this — pin it down.
+    #[test]
+    fn binary_no_nul_at_eof_preserves_length() {
+        // Placeholder-only at EOF: 4 bytes in → 4 bytes out (XY + 2 padding).
+        let groups = collect_binary_offsets(b"ABCD", b"ABCD");
+        let out = binary_ranged_read(b"ABCD", b"ABCD", b"XY", &groups, 0, 4);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out, b"XY\x00\x00");
+
+        // Placeholder + trailing bytes, no NUL: 6 bytes in → 6 bytes out.
+        let groups = collect_binary_offsets(b"ABCDMN", b"ABCD");
+        let out = binary_ranged_read(b"ABCDMN", b"ABCD", b"Z", &groups, 0, 6);
+        assert_eq!(out.len(), 6);
+        assert_eq!(out, b"ZMN\x00\x00\x00");
+    }
 }

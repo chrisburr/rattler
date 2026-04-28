@@ -17,6 +17,8 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 const SUPERBLOB_MAGIC: u32 = 0xfade0cc0;
 const CODE_DIRECTORY_MAGIC: u32 = 0xfade0c02;
 const HASH_TYPE_SHA256: u8 = 2;
+/// `CodeDirectory` `flags` bit indicating an ad-hoc signature.
+const CS_ADHOC: u32 = 0x2;
 
 #[derive(Debug)]
 pub enum CodesignError {
@@ -26,6 +28,11 @@ pub enum CodesignError {
     InvalidSuperBlob,
     NoCodeDirectory,
     UnsupportedHashType(u8),
+    /// The `CodeDirectory` does not have the ad-hoc flag set, meaning the
+    /// binary carries a real signature (Developer-ID, CMS, etc.). Rewriting
+    /// page hashes would invalidate that signature and cause the kernel to
+    /// reject the binary at exec time, so we refuse.
+    NotAdHoc,
 }
 
 impl fmt::Display for CodesignError {
@@ -38,6 +45,12 @@ impl fmt::Display for CodesignError {
             Self::NoCodeDirectory => write!(f, "CodeDirectory not found in SuperBlob"),
             Self::UnsupportedHashType(t) => {
                 write!(f, "unsupported hash type {t} (expected SHA-256)")
+            }
+            Self::NotAdHoc => {
+                write!(
+                    f,
+                    "binary is not ad-hoc signed (refusing to rewrite hashes)"
+                )
             }
         }
     }
@@ -161,12 +174,22 @@ fn resign_macho_slice(data: &mut [u8]) -> Result<(), CodesignError> {
     if cd_abs + 44 > data.len() {
         return Err(CodesignError::OutOfBounds);
     }
+    let flags = read_u32_be(data, cd_abs + 12);
     let hash_offset = read_u32_be(data, cd_abs + 16) as usize;
     let n_code_slots = read_u32_be(data, cd_abs + 28) as usize;
     let code_limit = read_u32_be(data, cd_abs + 32) as usize;
     let hash_size = data[cd_abs + 36] as usize;
     let hash_type = data[cd_abs + 37];
     let page_size_log2 = data[cd_abs + 39];
+
+    // Refuse to rewrite hashes for non-ad-hoc binaries. A Developer-ID or
+    // CMS-signed binary carries a CMS blob that authenticates the original
+    // hashes; re-hashing would invalidate it and the kernel would reject the
+    // binary at exec time. Conda packages are unsigned or ad-hoc, so this
+    // path is unreachable in practice — the check is defence-in-depth.
+    if (flags & CS_ADHOC) == 0 {
+        return Err(CodesignError::NotAdHoc);
+    }
 
     if hash_type != HASH_TYPE_SHA256 {
         return Err(CodesignError::UnsupportedHashType(hash_type));
@@ -719,5 +742,30 @@ mod tests {
         data[cd_abs + 28..cd_abs + 32].copy_from_slice(&0u32.to_be_bytes());
         // Should succeed (nothing to resign)
         assert!(resign_macho_slice(&mut data).is_ok());
+    }
+
+    /// Refuse to rewrite hashes when the `CodeDirectory` `flags` field does
+    /// not have the ad-hoc bit set. A Developer-ID or CMS-signed binary
+    /// would have its outer signature invalidated by hash rewriting; the
+    /// kernel would then reject it at exec with a confusing error.
+    #[test]
+    fn test_resign_refuses_non_adhoc() {
+        let mut data = build_test_macho(&[b"test"], "test", false);
+        let snapshot = data.clone();
+        let (dataoff, _) = find_code_signature(&data).unwrap();
+        let cd_off = find_code_directory(&data[dataoff as usize..]).unwrap();
+        let cd_abs = dataoff as usize + cd_off;
+        // Clear the ad-hoc bit, simulating a Developer-ID signed binary.
+        data[cd_abs + 12..cd_abs + 16].copy_from_slice(&0u32.to_be_bytes());
+        let snapshot_with_cleared_flag = data.clone();
+
+        assert!(matches!(
+            resign_macho_slice(&mut data),
+            Err(CodesignError::NotAdHoc)
+        ));
+        // Buffer must be untouched — we bail before any hash is written.
+        assert_eq!(data, snapshot_with_cleared_flag);
+        // And the only difference from the original is the flags field.
+        assert_eq!(snapshot.len(), data.len());
     }
 }

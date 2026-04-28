@@ -101,20 +101,39 @@ impl<T: VfsOps> NfsAdapter<T> {
         let addr = format!("127.0.0.1:{port}");
         let listener = NFSTcpListener::bind(&addr, self).await?;
         let actual_port = listener.get_listen_port();
-        // Wrap the server task so unexpected exits (errors or clean returns)
-        // are logged instead of silently swallowed.  Panics are caught by
-        // tokio at the task boundary and logged at WARN level by default.
+        // Wrap the server task so unexpected exits (errors, clean returns, or
+        // panics) are logged. Panics are observed by spawning the work as a
+        // child task and awaiting its `JoinHandle` — without this wrapper a
+        // panic in `handle_forever` is silently swallowed by tokio's default
+        // task abort, leaving callers polling `is_healthy()` with no hint of
+        // why the server died.
         let handle = tokio::spawn(async move {
-            match listener.handle_forever().await {
-                Ok(()) => {
+            let inner = tokio::spawn(async move { listener.handle_forever().await });
+            match inner.await {
+                Ok(Ok(())) => {
                     tracing::error!(
                         "NFS server task exited unexpectedly (clean return). \
-                         The kernel mount is now stale — file accesses will hang."
+                         The kernel mount is now stale — file accesses will hang \
+                         until the caller polls `is_healthy()` and unmounts."
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!(
                         "NFS server task failed: {e}. \
+                         The kernel mount is now stale — file accesses will hang \
+                         until the caller polls `is_healthy()` and unmounts."
+                    );
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    tracing::error!(
+                        "NFS server task PANICKED: {join_err}. \
+                         The kernel mount is now stale — file accesses will hang \
+                         until the caller polls `is_healthy()` and unmounts."
+                    );
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        "NFS server task aborted: {join_err}. \
                          The kernel mount is now stale — file accesses will hang."
                     );
                 }
@@ -321,7 +340,17 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 /// Convert NFS wire-format filename bytes to an OS string.
 /// On Unix, filenames are arbitrary byte sequences. On Windows, they must be
 /// valid UTF-8 (which conda paths always are — they're sourced from JSON).
+///
+/// Rejects path-traversal components: empty, ".", "..", and names containing
+/// a path separator. Unlike FUSE (where libfuse strips these in the kernel),
+/// NFS servers receive raw wire bytes and must validate themselves.
 fn os_str_from_nfs_bytes(bytes: &[u8]) -> Result<OsString, nfsstat3> {
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(nfsstat3::NFS3ERR_INVAL);
+    }
+    if bytes.contains(&b'/') {
+        return Err(nfsstat3::NFS3ERR_INVAL);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -330,7 +359,12 @@ fn os_str_from_nfs_bytes(bytes: &[u8]) -> Result<OsString, nfsstat3> {
     #[cfg(not(unix))]
     {
         match std::str::from_utf8(bytes) {
-            Ok(s) => Ok(OsString::from(s)),
+            Ok(s) => {
+                if s.contains('\\') {
+                    return Err(nfsstat3::NFS3ERR_INVAL);
+                }
+                Ok(OsString::from(s))
+            }
             Err(_) => Err(nfsstat3::NFS3ERR_INVAL),
         }
     }
@@ -665,5 +699,26 @@ impl<T: VfsOps> NfsFileSystem for NfsAdapter<T> {
         _attr: &sattr3,
     ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
         Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_str_from_nfs_bytes_rejects_traversal() {
+        // Path-traversal names must be rejected before they can reach the VFS,
+        // since NFS (unlike FUSE) does not get kernel-side filtering.
+        assert!(os_str_from_nfs_bytes(b"").is_err());
+        assert!(os_str_from_nfs_bytes(b".").is_err());
+        assert!(os_str_from_nfs_bytes(b"..").is_err());
+        assert!(os_str_from_nfs_bytes(b"foo/bar").is_err());
+        assert!(os_str_from_nfs_bytes(b"../etc/passwd").is_err());
+
+        // Plain names still flow through.
+        assert!(os_str_from_nfs_bytes(b"file.txt").is_ok());
+        assert!(os_str_from_nfs_bytes(b".hidden").is_ok());
+        assert!(os_str_from_nfs_bytes(b"..hidden").is_ok());
     }
 }

@@ -150,8 +150,7 @@ impl PackageSource for CondaPackage {
     }
 
     fn files(&self, mount_point: &Path) -> anyhow::Result<Vec<PackageFile>> {
-        let mut out =
-            Vec::with_capacity(self.paths_json.paths.len() + self.entry_points.len());
+        let mut out = Vec::with_capacity(self.paths_json.paths.len() + self.entry_points.len());
 
         for path in &self.paths_json.paths {
             // Noarch-python path rewriting: `site-packages/*` →
@@ -193,8 +192,7 @@ impl PackageSource for CondaPackage {
         if let Some(python_info) = &self.python_info {
             let target_prefix = mount_point.to_string_lossy();
             for ep in &self.entry_points {
-                let content =
-                    python_entry_point_template(&target_prefix, false, ep, python_info);
+                let content = python_entry_point_template(&target_prefix, false, ep, python_info);
                 out.push(PackageFile {
                     relative_path: PathBuf::from("bin").join(ep.command.as_str()),
                     content: FileContent::Inline(content.into_bytes()),

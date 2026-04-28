@@ -199,7 +199,13 @@ impl<T: VfsOps> ProjFsAdapter<T> {
             ..Default::default()
         };
 
+        // Hand a strong Arc reference to ProjFS as the InstanceContext.
+        // The matching `Arc::from_raw` happens in `ProjFsHandle::Drop` after
+        // `PrjStopVirtualizing` returns, which guarantees no callbacks remain
+        // in flight. Without that reclaim the adapter and its caches leaked
+        // per mount cycle.
         let context = Arc::into_raw(adapter.clone()) as *const std::ffi::c_void;
+        let reclaim_fn = reclaim_instance_context::<T>;
 
         // Match EdenFS: register for rename and post-mutation events so
         // ProjFS can track placeholder state transitions accurately.
@@ -238,19 +244,42 @@ impl<T: VfsOps> ProjFsAdapter<T> {
         Ok(ProjFsHandle {
             context: virt_context,
             _adapter: adapter,
+            instance_context: context,
+            reclaim_context: reclaim_fn,
             stopped: false,
         })
+    }
+}
+
+/// Reclaim the strong `Arc<ProjFsAdapter<T>>` reference handed to ProjFS
+/// via `Arc::into_raw`. Captured as a function pointer at `start()` time so
+/// `ProjFsHandle::Drop` doesn't need to be generic over `T`.
+fn reclaim_instance_context<T: VfsOps>(ptr: *const std::ffi::c_void) {
+    unsafe {
+        let _ = Arc::from_raw(ptr as *const ProjFsAdapter<T>);
     }
 }
 
 /// Handle to a running ProjFS virtualization instance. Stops on drop.
 pub struct ProjFsHandle {
     context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    /// Defence-in-depth strong reference. The `instance_context` raw
+    /// pointer below also holds one. Both are released in `Drop`.
     _adapter: Arc<dyn std::any::Any + Send + Sync>,
+    /// Raw pointer handed to ProjFS as `InstanceContext`. Reclaimed in Drop.
+    instance_context: *const std::ffi::c_void,
+    /// Type-erased reclaim function captured at start() time so Drop can
+    /// run `Arc::from_raw` against the original `ProjFsAdapter<T>` type.
+    reclaim_context: fn(*const std::ffi::c_void),
     /// Whether `PrjStopVirtualizing` has already been called. Set by
     /// `unmount()`; checked by `Drop` to avoid double-stopping.
     stopped: bool,
 }
+
+// Safe because `instance_context` is an opaque InstanceContext owned by
+// ProjFS for the lifetime of the handle; we only reclaim it on Drop.
+unsafe impl Send for ProjFsHandle {}
+unsafe impl Sync for ProjFsHandle {}
 
 impl ProjFsHandle {
     /// Explicitly stop ProjFS virtualization.
@@ -276,6 +305,13 @@ impl Drop for ProjFsHandle {
             unsafe {
                 PrjStopVirtualizing(self.context);
             }
+            self.stopped = true;
+        }
+        // After PrjStopVirtualizing returns, ProjFS guarantees no callbacks
+        // are in flight, so reclaiming the strong reference is sound.
+        if !self.instance_context.is_null() {
+            (self.reclaim_context)(self.instance_context);
+            self.instance_context = std::ptr::null();
         }
     }
 }
