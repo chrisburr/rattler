@@ -668,6 +668,8 @@ if $use_overlay and $transport != "projfs" {
 try { ^timeout 5 rm -rf $mount_point } catch { }
 
 if not $all_ok {
+    print "\n== rattler mount log: auto-whiteout traces (if any):"
+    try { open $log_file | lines | where ($it | str contains "auto-whiteout") | each { |l| print $l } } catch { }
     print "\n== rattler mount log tail:"
     try { open $log_file | lines | last 30 | each { |l| print $l } } catch { }
     exit 1
