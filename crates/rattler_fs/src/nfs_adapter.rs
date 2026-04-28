@@ -473,7 +473,11 @@ impl<T: VfsOps> NfsReadFileSystem for NfsAdapter<T> {
         let vfs = self.vfs.clone();
         let ino = id.as_u64();
         tokio::task::spawn_blocking(move || {
-            let attr = vfs.getattr(ino).map_err(fh_op_err)?;
+            // NFS file handles are bound to the inode at lookup time. After a
+            // sibling client COWs the file, the lower→upper redirect must NOT
+            // apply to a fh issued before that promotion — otherwise the same
+            // fh would silently switch between lower and upper attrs.
+            let attr = vfs.getattr_strict(ino).map_err(fh_op_err)?;
             Ok(file_attr_to_fattr3(&attr))
         })
         .await

@@ -149,6 +149,22 @@ pub struct DirEntry {
 pub trait VfsOps: Send + Sync + 'static {
     fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, i32>;
     fn getattr(&self, ino: u64) -> Result<FileAttr, i32>;
+
+    /// Return attrs for the given inode without following overlay redirects.
+    ///
+    /// `getattr` resolves a path-side inode through the overlay's promoted
+    /// (lower → upper) map, which is correct for path-based stats but wrong
+    /// for `fstat()` on a file descriptor that was opened before COW: such an
+    /// fd is bound to the original inode and must keep seeing its attrs.
+    /// Adapters that hold the original inode in their open-files table call
+    /// this variant when an `fh` is present.
+    ///
+    /// For implementations without redirects (e.g. `VirtualFS`), this is a
+    /// straight delegation to `getattr`.
+    fn getattr_strict(&self, ino: u64) -> Result<FileAttr, i32> {
+        self.getattr(ino)
+    }
+
     fn readlink(&self, ino: u64) -> Result<PathBuf, i32>;
 
     /// Read bytes from a file at the given offset. The VFS handles prefix

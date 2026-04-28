@@ -230,8 +230,18 @@ impl<T: VfsOps> OverlayFS<T> {
     }
 
     fn resolve_ino(&self, ino: u64) -> Result<ResolvedIno, i32> {
+        self.resolve_ino_inner(ino, true)
+    }
+
+    /// Like [`resolve_ino`](Self::resolve_ino) but optionally bypasses the
+    /// lower→upper promotion redirect. Used by
+    /// [`getattr_strict`](Self::getattr_strict) for fh-bound metadata: a file
+    /// descriptor opened on a lower inode before COW remains bound to that
+    /// inode for `fstat()`, even after a sibling fd promotes the path to
+    /// upper. Path-side callers always pass `follow_redirect = true`.
+    fn resolve_ino_inner(&self, ino: u64, follow_redirect: bool) -> Result<ResolvedIno, i32> {
         // Check if this lower inode was promoted to upper via rename or COW
-        let effective = if ino < UPPER_INODE_BASE {
+        let effective = if follow_redirect && ino < UPPER_INODE_BASE {
             self.promoted.lock_or_eio()?.get(&ino).copied()
         } else {
             None
@@ -567,6 +577,25 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 }
             }
             ResolvedIno::Lower(lower_ino, _) => self.lower.getattr(lower_ino),
+        }
+    }
+
+    /// Strict variant for adapters dispatching `fstat()` on a held fd: skip
+    /// the lower→upper promotion redirect so a pre-COW open keeps seeing its
+    /// original inode's attrs. See [`Self::resolve_ino_inner`] for why.
+    fn getattr_strict(&self, ino: u64) -> Result<FileAttr, i32> {
+        match self.resolve_ino_inner(ino, false)? {
+            ResolvedIno::Upper(path) => match self.make_upper_attr(&path, ino) {
+                Ok(attr) => Ok(attr),
+                Err(_) => {
+                    if let Some(lower_ino) = self.lower_ino_for_path(&path) {
+                        self.lower.getattr_strict(lower_ino)
+                    } else {
+                        Err(ENOENT)
+                    }
+                }
+            },
+            ResolvedIno::Lower(lower_ino, _) => self.lower.getattr_strict(lower_ino),
         }
     }
 
@@ -1963,6 +1992,75 @@ mod tests {
         // read with lower inode should return modified content
         let data = ofs.read(4, 0, 1024).unwrap();
         assert_eq!(data, b"modified content");
+    }
+
+    /// Regression: a file descriptor opened on a lower inode before COW must
+    /// keep seeing the lower file's attrs via `getattr_strict`, even after a
+    /// sibling fd has triggered COW and `promoted` redirects path-based
+    /// `getattr` to upper. Without `getattr_strict` the two metadata views
+    /// (path vs. fh) drift apart and `fstat(fd)` no longer matches `read(fd)`.
+    #[test]
+    fn test_getattr_strict_ignores_promotion_after_cow() {
+        let tmp = TempDir::new().unwrap();
+        let overlay_dir = tmp.path().join("upper");
+        let ofs = OverlayFS::new(
+            MockLowerWithFiles,
+            overlay_dir,
+            "hash".into(),
+            "test".into(),
+        )
+        .unwrap();
+
+        // Resolve foo.py to its lower inode. This is the inode an early
+        // read-only opener would bind to.
+        let lib = ofs.lookup(1, OsStr::new("lib")).unwrap();
+        let python = ofs.lookup(lib.ino, OsStr::new("python")).unwrap();
+        let foo = ofs.lookup(python.ino, OsStr::new("foo.py")).unwrap();
+        let lower_ino = foo.ino;
+        let lower_size = foo.size;
+
+        // Sibling writer: open for write (COW), grow the file, release.
+        let fh = ofs.open_write(lower_ino).unwrap();
+        ofs.write(fh, 0, b"modified content").unwrap();
+        ofs.release_write(fh);
+
+        // Path-side `getattr` (and `lookup`) follow the promoted redirect →
+        // upper attrs.
+        let upper_attr = ofs.getattr(lower_ino).unwrap();
+        assert_eq!(upper_attr.size, 16);
+
+        // fh-side `getattr_strict` skips the redirect → original lower attrs.
+        // This is what `fstat(fha)` must return so it stays coherent with
+        // `read(fha)`, which still serves the frozen lower mmap.
+        let strict_attr = ofs.getattr_strict(lower_ino).unwrap();
+        assert_eq!(strict_attr.size, lower_size);
+        assert_ne!(upper_attr.size, strict_attr.size);
+    }
+
+    /// `getattr_strict` on an upper-only inode should behave identically to
+    /// `getattr`: there is no redirect to skip, so both must agree.
+    #[test]
+    fn test_getattr_strict_matches_getattr_for_upper_only_inode() {
+        let tmp = TempDir::new().unwrap();
+        let overlay_dir = tmp.path().join("upper");
+        let ofs = OverlayFS::new(
+            MockLowerWithFiles,
+            overlay_dir,
+            "hash".into(),
+            "test".into(),
+        )
+        .unwrap();
+
+        // Create a brand-new upper-only file via the overlay.
+        let (attr, fh) = ofs.create(1, OsStr::new("new.txt"), 0o644).unwrap();
+        ofs.write(fh, 0, b"hello").unwrap();
+        ofs.release_write(fh);
+
+        let g = ofs.getattr(attr.ino).unwrap();
+        let s = ofs.getattr_strict(attr.ino).unwrap();
+        assert_eq!(g.ino, s.ino);
+        assert_eq!(g.size, s.size);
+        assert_eq!(g.size, 5);
     }
 
     #[test]
