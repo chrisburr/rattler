@@ -50,7 +50,12 @@ jobs:
           workspaces: . -> .pixi/target
           key: rattler-linux-pixi
           shared-key: rattler-linux-pixi
+      # -static-libgcc embeds libgcc_s so the binary doesn't depend on the
+      # builder's GCC runtime symbol versions (e.g. GCC_12.0.0), which aren't
+      # present on older targets like AlmaLinux 9 / lxplus.
       - run: pixi run -e default cargo build --release -p rattler-bin --features mount
+        env:
+          RUSTFLAGS: "-C link-arg=-static-libgcc"
       - name: Stage rattler
         run: |
           mkdir -p bin-staging
