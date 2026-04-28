@@ -252,6 +252,11 @@ impl<T: VfsOps> OverlayFS<T> {
                     continue;
                 }
                 if !state.is_whiteout(&path.join(&entry.name)) {
+                    tracing::warn!(
+                        "auto-whiteout {:?}: lower child {:?} still visible",
+                        path,
+                        entry.name
+                    );
                     return Ok(());
                 }
             }
@@ -261,11 +266,18 @@ impl<T: VfsOps> OverlayFS<T> {
         let upper = self.upper_path(path);
         if let Ok(read_dir) = fs::read_dir(&upper) {
             for entry in read_dir.flatten() {
-                if !is_overlay_internal_name(&entry.file_name()) {
+                let name = entry.file_name();
+                if !is_overlay_internal_name(&name) {
+                    tracing::warn!(
+                        "auto-whiteout {:?}: upper has non-internal {:?}",
+                        path,
+                        name
+                    );
                     return Ok(());
                 }
             }
         }
+        tracing::warn!("auto-whiteout {:?}: sweeping", path);
 
         // Strip on-disk markers (so `remove_dir` succeeds) but leave the
         // in-memory child whiteouts intact — `clear_dir_markers` would also
