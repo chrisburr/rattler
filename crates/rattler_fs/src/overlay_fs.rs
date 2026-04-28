@@ -915,11 +915,15 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                     .map_err(|_e| EIO)?;
                 if let Err(e2) = fs::remove_dir(&upper_path) {
                     if e2.kind() != std::io::ErrorKind::NotFound {
+                        let leftover: Vec<_> = fs::read_dir(&upper_path)
+                            .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                            .unwrap_or_default();
                         tracing::warn!(
-                            "unlink/rmdir failed {:?}: file={}, dir={}",
+                            "unlink/rmdir failed {:?}: file={}, dir={}, leftover={:?}",
                             upper_path,
                             e,
-                            e2
+                            e2,
+                            leftover
                         );
                         return Err(e2.raw_os_error().unwrap_or(EIO));
                     }
