@@ -3,6 +3,33 @@
 //! Wraps a read-only `VfsOps` (the lower layer) with a persistent upper
 //! directory for copy-on-write semantics. Implements the same `VfsOps` trait
 //! so it can be used interchangeably with the read-only VFS.
+//!
+//! # Concurrency: lock hierarchy
+//!
+//! [`OverlayFS`] holds five `Mutex` fields plus an `AtomicU64`. Operations
+//! that need more than one lock at a time MUST acquire them in this order
+//! (top to bottom) — code that violates the order risks deadlock under
+//! contention:
+//!
+//! 1. `state` (whiteout / opaque-dir cache + on-disk markers)
+//! 2. `upper_inodes` (virtual-path → inode map for upper-layer entries)
+//! 3. `promoted` (lower-inode → upper-inode remapping after COW)
+//! 4. `lower_ino_cache` (path → lower-inode cache; pure optimisation)
+//! 5. `open_files` (file handle → `File`)
+//!
+//! [`Self::lower_ino_for_path`] acquires `lower_ino_cache` internally, so
+//! callers must not already hold it. Callers may hold `state` while
+//! invoking [`Self::lower_ino_for_path`] (`state` ≻ `lower_ino_cache` in
+//! the hierarchy).
+//!
+//! # Concurrency: poisoning
+//!
+//! Every lock acquisition uses [`MutexExt::lock_or_eio`], which converts
+//! `PoisonError` into [`libc::EIO`] for the current operation rather than
+//! letting a panic in one operation cascade and brick the whole overlay.
+//! `lower_ino_cache` reads use [`MutexExt::lock_or_none`] because a
+//! poisoned cache is recoverable: callers fall back to a fresh
+//! lower-layer lookup, which is correct (just slower).
 
 use libc::{EIO, ENOENT};
 use std::{
@@ -13,9 +40,45 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Mutex, MutexGuard,
     },
 };
+
+/// Convert mutex `PoisonError` into errno values.
+///
+/// Without this, every `.lock().unwrap()` site panics on poison and that
+/// panic typically poisons more locks, cascading until the overlay is
+/// effectively unusable. Translating to `EIO` lets the current syscall
+/// fail cleanly while keeping the rest of the FS alive — and gives the
+/// kernel/client a chance to retry.
+trait MutexExt<T> {
+    /// Acquire the lock; convert poison to `EIO`.
+    fn lock_or_eio(&self) -> Result<MutexGuard<'_, T>, i32>;
+
+    /// Acquire the lock; convert poison to `None`. Use for caches where a
+    /// poisoned state is equivalent to a cache miss (the caller can
+    /// recompute from the source of truth).
+    fn lock_or_none(&self) -> Option<MutexGuard<'_, T>>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_or_eio(&self) -> Result<MutexGuard<'_, T>, i32> {
+        self.lock().map_err(|e| {
+            tracing::error!("overlay mutex poisoned: {e}");
+            EIO
+        })
+    }
+
+    fn lock_or_none(&self) -> Option<MutexGuard<'_, T>> {
+        match self.lock() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!("overlay cache mutex poisoned, treating as miss: {e}");
+                None
+            }
+        }
+    }
+}
 
 mod inode;
 
@@ -112,7 +175,8 @@ impl<T: VfsOps> OverlayFS<T> {
                 .strip_prefix(&self.overlay_dir)
                 .map_err(|e| format!("path error: {e}"))?
                 .to_path_buf();
-            self.assign_upper_ino(relative);
+            self.assign_upper_ino(relative)
+                .map_err(|errno| format!("assign_upper_ino failed: errno={errno}"))?;
 
             if path.is_dir() {
                 self.scan_upper(&path)?;
@@ -121,11 +185,8 @@ impl<T: VfsOps> OverlayFS<T> {
         Ok(())
     }
 
-    fn assign_upper_ino(&self, virtual_path: PathBuf) -> u64 {
-        self.upper_inodes
-            .lock()
-            .unwrap()
-            .get_or_assign(virtual_path)
+    fn assign_upper_ino(&self, virtual_path: PathBuf) -> Result<u64, i32> {
+        Ok(self.upper_inodes.lock_or_eio()?.get_or_assign(virtual_path))
     }
 
     /// Get the on-disk upper layer path for a virtual path (no lock needed).
@@ -152,14 +213,14 @@ impl<T: VfsOps> OverlayFS<T> {
     fn resolve_ino(&self, ino: u64) -> Result<ResolvedIno, i32> {
         // Check if this lower inode was promoted to upper via rename or COW
         let effective = if ino < UPPER_INODE_BASE {
-            self.promoted.lock().unwrap().get(&ino).copied()
+            self.promoted.lock_or_eio()?.get(&ino).copied()
         } else {
             None
         };
         let effective_ino = effective.unwrap_or(ino);
 
         if effective_ino >= UPPER_INODE_BASE {
-            let map = self.upper_inodes.lock().unwrap();
+            let map = self.upper_inodes.lock_or_eio()?;
             let path = map.path_for(effective_ino).cloned().ok_or_else(|| {
                 tracing::warn!(
                     "overlay resolve_ino: upper ino={} not found in inode map",
@@ -179,9 +240,9 @@ impl<T: VfsOps> OverlayFS<T> {
             return Some(1);
         }
 
-        // Check cache for the full path first
-        {
-            let cache = self.lower_ino_cache.lock().unwrap();
+        // Check cache for the full path first. A poisoned cache is
+        // equivalent to a miss — we'll fall through to a fresh lookup.
+        if let Some(cache) = self.lower_ino_cache.lock_or_none() {
             if let Some(&ino) = cache.get(path) {
                 return Some(ino);
             }
@@ -197,8 +258,7 @@ impl<T: VfsOps> OverlayFS<T> {
 
             // Check cache for intermediate prefix
             current_path.push(name);
-            {
-                let cache = self.lower_ino_cache.lock().unwrap();
+            if let Some(cache) = self.lower_ino_cache.lock_or_none() {
                 if let Some(&cached_ino) = cache.get(&current_path) {
                     current_ino = cached_ino;
                     continue;
@@ -214,11 +274,13 @@ impl<T: VfsOps> OverlayFS<T> {
             }
         }
 
-        // Batch insert all new cache entries
+        // Batch insert all new cache entries (skip silently if poisoned —
+        // the lookup result is still correct, just uncached).
         if !new_entries.is_empty() {
-            let mut cache = self.lower_ino_cache.lock().unwrap();
-            for (path, ino) in new_entries {
-                cache.insert(path, ino);
+            if let Some(mut cache) = self.lower_ino_cache.lock_or_none() {
+                for (path, ino) in new_entries {
+                    cache.insert(path, ino);
+                }
             }
         }
 
@@ -304,7 +366,7 @@ impl<T: VfsOps> OverlayFS<T> {
             EIO
         })?;
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock_or_eio()?;
         let entries = self.lower.readdir(lower_ino, 0).unwrap_or_default();
         // Collect entries to avoid holding state lock during recursive COW
         let children: Vec<_> = entries
@@ -383,7 +445,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
 
         // Single state lock: check whiteout and opaque in one acquisition
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock_or_eio()?;
             if state.is_whiteout(&virtual_path) {
                 return Err(ENOENT);
             }
@@ -395,7 +457,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // Check upper layer — use symlink_metadata directly (avoids TOCTOU of exists + stat)
         let upper = self.upper_path(&virtual_path);
         if let Ok(metadata) = fs::symlink_metadata(&upper) {
-            let ino = self.assign_upper_ino(virtual_path.clone());
+            let ino = self.assign_upper_ino(virtual_path.clone())?;
             return Ok(FileAttr::from_metadata(&metadata, ino));
         }
 
@@ -403,10 +465,11 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         if let Some(lower_parent_ino) = self.lower_ino_for_path(&parent_path) {
             let result = self.lower.lookup(lower_parent_ino, name);
             if let Ok(ref attr) = result {
-                self.lower_ino_cache
-                    .lock()
-                    .unwrap()
-                    .insert(virtual_path, attr.ino);
+                // Best-effort cache update — a poisoned cache is fine,
+                // we just don't record this lookup.
+                if let Some(mut cache) = self.lower_ino_cache.lock_or_none() {
+                    cache.insert(virtual_path, attr.ino);
+                }
             }
             result
         } else {
@@ -501,8 +564,8 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             // Promote: the kernel may call getattr/read with the original lower
             // inode after this COW, so redirect it to the upper copy.
             if ino < UPPER_INODE_BASE {
-                let upper_ino = self.assign_upper_ino(virtual_path.clone());
-                self.promoted.lock().unwrap().insert(ino, upper_ino);
+                let upper_ino = self.assign_upper_ino(virtual_path.clone())?;
+                self.promoted.lock_or_eio()?.insert(ino, upper_ino);
             }
         }
 
@@ -516,12 +579,12 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 EIO
             })?;
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.open_files.lock().unwrap().insert(fh, file);
+        self.open_files.lock_or_eio()?.insert(fh, file);
         Ok(fh)
     }
 
     fn read_handle(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        let mut files = self.open_files.lock().unwrap();
+        let mut files = self.open_files.lock_or_eio()?;
         let file = files.get_mut(&fh).ok_or(EIO)?;
         file.seek(SeekFrom::Start(offset)).map_err(|_e| EIO)?;
         let mut buf = vec![0u8; size as usize];
@@ -531,7 +594,17 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
     }
 
     fn release_write(&self, fh: u64) {
-        self.open_files.lock().unwrap().remove(&fh);
+        // No Result return — best-effort. Poison here means the handle
+        // map is unrecoverable; the kernel will eventually reuse the fh
+        // and we'll fail subsequent ops cleanly via lock_or_eio.
+        match self.open_files.lock() {
+            Ok(mut files) => {
+                files.remove(&fh);
+            }
+            Err(e) => {
+                tracing::error!("release_write: open_files poisoned, leaking fh={fh}: {e}");
+            }
+        }
     }
 
     fn readdir(&self, ino: u64, offset: u64) -> Result<Vec<DirEntry>, i32> {
@@ -542,7 +615,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             }
             ResolvedIno::Lower(li, p) => (p, Some(li)),
         };
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock_or_eio()?;
 
         // Collect entries by name — upper overrides lower
         let mut entries_by_name: HashMap<OsString, DirEntry> = HashMap::new();
@@ -583,7 +656,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                     continue;
                 }
                 let child_path = dir_path.join(&name);
-                let child_ino = self.assign_upper_ino(child_path);
+                let child_ino = self.assign_upper_ino(child_path)?;
                 let kind = if entry.path().is_dir() {
                     FileKind::Directory
                 } else {
@@ -659,8 +732,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         set_file_permissions(&upper_path, mode).ok();
 
         self.state
-            .lock()
-            .unwrap()
+            .lock_or_eio()?
             .remove_whiteout(&virtual_path)
             .map_err(|e| {
                 tracing::warn!(
@@ -671,17 +743,17 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 EIO
             })?;
 
-        let ino = self.assign_upper_ino(virtual_path.clone());
+        let ino = self.assign_upper_ino(virtual_path.clone())?;
         let attr = self.make_upper_attr(&virtual_path, ino)?;
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.open_files.lock().unwrap().insert(fh, file);
+        self.open_files.lock_or_eio()?.insert(fh, file);
 
         Ok((attr, fh))
     }
 
     fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
-        let mut files = self.open_files.lock().unwrap();
+        let mut files = self.open_files.lock_or_eio()?;
         let file = files.get_mut(&fh).ok_or_else(|| {
             tracing::warn!("overlay write: fh={} not found in open_files", fh);
             EIO
@@ -712,7 +784,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
             if let Ok(attr) = self.lower.getattr(lower_ino) {
                 if attr.kind == FileKind::Directory {
-                    let state = self.state.lock().unwrap();
+                    let state = self.state.lock_or_eio()?;
                     if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
                         let has_visible = lower_entries.iter().any(|e| {
                             if e.name == "." || e.name == ".." {
@@ -752,8 +824,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // deletions of upper-only files (e.g. .pyc temp files)
         if self.lower_ino_for_path(&virtual_path).is_some() {
             self.state
-                .lock()
-                .unwrap()
+                .lock_or_eio()?
                 .add_whiteout(virtual_path)
                 .map_err(|_e| EIO)?;
         }
@@ -772,7 +843,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         set_file_permissions(&upper_path, mode).ok();
 
         // Only mark opaque if previously whiteout'd (rmdir + mkdir pattern)
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_or_eio()?;
         let was_whiteoutd = state.is_whiteout(&virtual_path);
         state.remove_whiteout(&virtual_path).map_err(|_e| EIO)?;
         if was_whiteoutd && self.lower_ino_for_path(&virtual_path).is_some() {
@@ -782,7 +853,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         }
         drop(state);
 
-        let ino = self.assign_upper_ino(virtual_path.clone());
+        let ino = self.assign_upper_ino(virtual_path.clone())?;
         self.make_upper_attr(&virtual_path, ino)
     }
 
@@ -795,7 +866,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // hide them all (the whiteout on the directory itself blocks lookups for
         // every child).
         if let Some(lower_ino) = self.lower_ino_for_path(&virtual_path) {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock_or_eio()?;
             if let Ok(lower_entries) = self.lower.readdir(lower_ino, 0) {
                 let has_visible = lower_entries.iter().any(|e| {
                     if e.name == "." || e.name == ".." {
@@ -815,8 +886,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // parent's view) subsumes those per-child markers anyway.
         if upper_path.exists() {
             self.state
-                .lock()
-                .unwrap()
+                .lock_or_eio()?
                 .clear_dir_markers(&virtual_path)
                 .map_err(|_e| EIO)?;
         }
@@ -830,8 +900,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
 
         if self.lower_ino_for_path(&virtual_path).is_some() {
             self.state
-                .lock()
-                .unwrap()
+                .lock_or_eio()?
                 .add_whiteout(virtual_path)
                 .map_err(|_e| EIO)?;
         }
@@ -854,7 +923,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             if self.upper_path(&dst_check).exists() {
                 return Err(libc::EEXIST);
             }
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock_or_eio()?;
             if !state.is_whiteout(&dst_check) && self.lower_ino_for_path(&dst_check).is_some() {
                 return Err(libc::EEXIST);
             }
@@ -879,7 +948,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             if let Some(lower_ino) = self.lower_ino_for_path(&src_path) {
                 if let Ok(attr) = self.lower.getattr(lower_ino) {
                     if attr.kind == FileKind::Directory {
-                        let state = self.state.lock().unwrap();
+                        let state = self.state.lock_or_eio()?;
                         let entries = self.lower.readdir(lower_ino, 0).unwrap_or_default();
                         let children: Vec<_> = entries
                             .into_iter()
@@ -922,8 +991,8 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
 
             // Promote: the kernel holds the lower inode for the source file.
             // After COW + rename, that inode must resolve to the upper destination.
-            let upper_ino = self.assign_upper_ino(dst_path.clone());
-            self.promoted.lock().unwrap().insert(attr.ino, upper_ino);
+            let upper_ino = self.assign_upper_ino(dst_path.clone())?;
+            self.promoted.lock_or_eio()?.insert(attr.ino, upper_ino);
         }
 
         // Only track whiteouts for paths that exist in the lower layer.
@@ -931,7 +1000,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // and the on-disk markers stay in sync as long as we go through
         // the API.
         let src_in_lower = self.lower_ino_for_path(&src_path).is_some();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_or_eio()?;
         if src_in_lower {
             state.add_whiteout(src_path.clone()).map_err(|_e| EIO)?;
         }
@@ -946,8 +1015,7 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // For lower→upper (COW), the inode was already assigned above.
         if upper_src_existed {
             self.upper_inodes
-                .lock()
-                .unwrap()
+                .lock_or_eio()?
                 .rename_path(&src_path, dst_path);
         }
         Ok(())
@@ -965,8 +1033,8 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             ResolvedIno::Upper(path) => (path, ino),
             ResolvedIno::Lower(lower_ino, path) => {
                 self.copy_to_upper(&path, lower_ino)?;
-                let ui = self.assign_upper_ino(path.clone());
-                self.promoted.lock().unwrap().insert(lower_ino, ui);
+                let ui = self.assign_upper_ino(path.clone())?;
+                self.promoted.lock_or_eio()?.insert(lower_ino, ui);
                 (path, ui)
             }
         };
