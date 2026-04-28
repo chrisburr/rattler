@@ -470,8 +470,9 @@ impl<T: VfsOps> Filesystem for FuseAdapter<T> {
     ) {
         match self.vfs.create(parent.0, name, mode) {
             Ok((attr, vfs_fh)) => {
+                let bound_ino = attr.ino;
                 let fattr: fuser::FileAttr = attr.into();
-                match self.store_open(attr.ino, OpenFileContent::VfsManaged(vfs_fh)) {
+                match self.store_open(bound_ino, OpenFileContent::VfsManaged(vfs_fh)) {
                     Ok(fh) => reply.created(
                         &Duration::MAX,
                         &fattr,
