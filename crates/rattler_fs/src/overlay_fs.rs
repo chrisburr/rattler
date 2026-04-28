@@ -876,6 +876,14 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // failure (EPERM on macOS, EISDIR on Linux) fall back to remove_dir.
         if let Err(e) = fs::remove_file(&upper_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
+                // Mirror `rmdir`: drain per-child `.wh.*` markers from the
+                // upper directory before remove_dir, otherwise the dir isn't
+                // empty and the rmdir fails. The dir's own whiteout (added
+                // below) subsumes those per-child markers anyway.
+                self.state
+                    .lock_or_eio()?
+                    .clear_dir_markers(&virtual_path)
+                    .map_err(|_e| EIO)?;
                 if let Err(e2) = fs::remove_dir(&upper_path) {
                     if e2.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(
