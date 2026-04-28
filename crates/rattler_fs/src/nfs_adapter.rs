@@ -384,6 +384,40 @@ fn errno_to_nfsstat(errno: i32) -> nfsstat3 {
     }
 }
 
+/// Error mapping for ops whose only input is a file handle (getattr,
+/// read, readlink, setattr, write, readdirplus). Treats `ENOENT` as a
+/// stale handle (`NFS3ERR_STALE`) rather than a missing name
+/// (`NFS3ERR_NOENT`).
+///
+/// The Linux NFS client interprets `ESTALE` on a held handle as "drop
+/// the dentry cache and re-lookup from the parent" — applications
+/// recover transparently via the next syscall. `ENOENT` on a held
+/// handle is propagated to userspace as "No such file or directory"
+/// mid-operation, which is the user-visible symptom we want to avoid
+/// when the handle's inode has been removed (unlinked, COW'd over,
+/// etc.).
+///
+/// We do NOT yet maintain a generation counter on the handle — that's
+/// tracked as follow-up. Until generations land, two distinct
+/// post-mount lifetimes of the same inode number resolve via STALE
+/// (caller re-lookup) rather than serving the wrong file silently.
+fn fh_op_err(errno: i32) -> nfsstat3 {
+    match errno {
+        libc::ENOENT => nfsstat3::NFS3ERR_STALE,
+        other => errno_to_nfsstat(other),
+    }
+}
+
+/// Maximum bytes we'll allocate for a single NFS READ response.
+///
+/// NFS3 READs are bounded by the server's preferred / negotiated
+/// `rsize`; common defaults are 32 KiB to 1 MiB. A buggy or malicious
+/// client can still send `count = u32::MAX` over the wire — without a
+/// cap, `read` would allocate 4 GiB on the server and OOM. 1 MiB
+/// matches Linux nfsd's default `rsize` and is generous for any real
+/// client that respects negotiation.
+const MAX_NFS_READ_BYTES: u32 = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // ReadDirPlus iterator backed by a pre-fetched Vec
 // ---------------------------------------------------------------------------
@@ -439,7 +473,7 @@ impl<T: VfsOps> NfsReadFileSystem for NfsAdapter<T> {
         let vfs = self.vfs.clone();
         let ino = id.as_u64();
         tokio::task::spawn_blocking(move || {
-            let attr = vfs.getattr(ino).map_err(errno_to_nfsstat)?;
+            let attr = vfs.getattr(ino).map_err(fh_op_err)?;
             Ok(file_attr_to_fattr3(&attr))
         })
         .await
@@ -457,9 +491,14 @@ impl<T: VfsOps> NfsReadFileSystem for NfsAdapter<T> {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let vfs = self.vfs.clone();
         let ino = id.as_u64();
+        // Cap the per-call allocation. The eof flag MUST be computed
+        // against the bounded count, not the original count, otherwise a
+        // client requesting more than MAX_NFS_READ_BYTES would treat the
+        // capped response as eof and stop reading.
+        let bounded = count.min(MAX_NFS_READ_BYTES);
         tokio::task::spawn_blocking(move || {
-            let data = vfs.read(ino, offset, count).map_err(errno_to_nfsstat)?;
-            let eof = (data.len() as u32) < count;
+            let data = vfs.read(ino, offset, bounded).map_err(fh_op_err)?;
+            let eof = (data.len() as u32) < bounded;
             Ok((data, eof))
         })
         .await
@@ -477,7 +516,7 @@ impl<T: VfsOps> NfsReadFileSystem for NfsAdapter<T> {
         let vfs = self.vfs.clone();
         let ino = dirid.as_u64();
         tokio::task::spawn_blocking(move || {
-            let dir_entries = vfs.readdir(ino, cookie).map_err(errno_to_nfsstat)?;
+            let dir_entries = vfs.readdir(ino, cookie).map_err(fh_op_err)?;
             let mut entries = Vec::with_capacity(dir_entries.len());
             for (i, de) in dir_entries.into_iter().enumerate() {
                 let attr = vfs.getattr(de.ino).ok().map(|a| file_attr_to_fattr3(&a));
@@ -502,7 +541,7 @@ impl<T: VfsOps> NfsReadFileSystem for NfsAdapter<T> {
         let vfs = self.vfs.clone();
         let ino = id.as_u64();
         tokio::task::spawn_blocking(move || {
-            let target = vfs.readlink(ino).map_err(errno_to_nfsstat)?;
+            let target = vfs.readlink(ino).map_err(fh_op_err)?;
             let bytes = target.as_os_str().as_encoded_bytes().to_vec();
             Ok(nfspath3(Opaque::owned(bytes)))
         })
@@ -531,7 +570,7 @@ impl<T: VfsOps> NfsFileSystem for NfsAdapter<T> {
                 Nfs3Option::Some(m) => Some(m),
                 Nfs3Option::None => None,
             };
-            let attr = vfs.setattr(ino, size, mode).map_err(errno_to_nfsstat)?;
+            let attr = vfs.setattr(ino, size, mode).map_err(fh_op_err)?;
             Ok(file_attr_to_fattr3(&attr))
         })
         .await
@@ -552,8 +591,8 @@ impl<T: VfsOps> NfsFileSystem for NfsAdapter<T> {
         let data = data.to_vec();
         let ino = id.as_u64();
         tokio::task::spawn_blocking(move || {
-            vfs.write(fh, offset, &data).map_err(errno_to_nfsstat)?;
-            let attr = vfs.getattr(ino).map_err(errno_to_nfsstat)?;
+            vfs.write(fh, offset, &data).map_err(fh_op_err)?;
+            let attr = vfs.getattr(ino).map_err(fh_op_err)?;
             Ok(file_attr_to_fattr3(&attr))
         })
         .await
