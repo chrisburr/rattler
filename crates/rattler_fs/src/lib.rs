@@ -580,6 +580,39 @@ impl MountConfig {
     }
 }
 
+/// Opaque newtype around `fuser::BackgroundSession`.
+///
+/// Wraps the upstream session so downstream consumers (pixi etc.) can
+/// pattern-match on [`MountHandle::Fuse`] without taking a direct
+/// dependency on the `fuser` crate just to name the inner type.
+#[cfg(any(target_os = "linux", feature = "fuse"))]
+pub struct FuseHandle {
+    // First field — `Drop` runs in struct field declaration order, so the
+    // session unmounts before any sibling state would be torn down. Today
+    // there are no siblings; the discipline is in place for when this
+    // newtype grows (e.g. an owned mountpoint TempDir).
+    session: fuser::BackgroundSession,
+}
+
+#[cfg(any(target_os = "linux", feature = "fuse"))]
+impl FuseHandle {
+    pub(crate) fn new(session: fuser::BackgroundSession) -> Self {
+        Self { session }
+    }
+
+    /// Drop the underlying session, which triggers the FUSE unmount path.
+    pub(crate) fn into_inner(self) -> fuser::BackgroundSession {
+        self.session
+    }
+}
+
+#[cfg(any(target_os = "linux", feature = "fuse"))]
+impl std::fmt::Debug for FuseHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuseHandle").finish_non_exhaustive()
+    }
+}
+
 /// Handle to a running mount.
 ///
 /// The mount stays live for as long as this handle exists. Dropping it
@@ -594,7 +627,7 @@ pub enum MountHandle {
     #[cfg(feature = "nfs")]
     Nfs(nfs_adapter::NfsMountHandle),
     #[cfg(any(target_os = "linux", feature = "fuse"))]
-    Fuse(fuser::BackgroundSession),
+    Fuse(FuseHandle),
     #[cfg(target_os = "windows")]
     ProjFs(projfs_adapter::ProjFsHandle),
 }
@@ -604,8 +637,16 @@ impl MountHandle {
     ///
     /// Currently only meaningful for the NFS transport, where the userspace
     /// server task can exit unexpectedly (panic, I/O error, or unexpected
-    /// clean return) leaving the kernel mount stale. FUSE and `ProjFS` mounts
-    /// are managed by the kernel and always report healthy from userspace.
+    /// clean return) leaving the kernel mount stale.
+    ///
+    /// **FUSE and `ProjFS` mounts always report `true` here, by design.**
+    /// Both are kernel-mediated: from userspace there is no in-process
+    /// signal that the kernel mount has gone stale (e.g. by an external
+    /// `umount` or by the kernel reaping a wedged session). Detecting
+    /// that requires probing through the mount itself (statfs, a marker
+    /// file open) which is the caller's responsibility — see pixi's
+    /// `MountGuard` for an example. Treat `true` here as "the userspace
+    /// server has not declared itself dead", not "the mount is usable".
     ///
     /// Pixi's `MountGuard` can poll this to detect a dead server before
     /// handing out a reference to the environment.
@@ -620,9 +661,18 @@ impl MountHandle {
 
     /// Explicitly unmount the filesystem and shut down the backing server.
     ///
-    /// This is async so the NFS unmount path can use `tokio::process::Command`
-    /// instead of blocking the runtime. FUSE and `ProjFS` unmount synchronously
-    /// (kernel-managed, no subprocess) so the async boundary is free for them.
+    /// `async` so the NFS unmount can shell out via
+    /// `tokio::process::Command` without blocking the runtime. FUSE and
+    /// `ProjFS` unmount synchronously by dropping the backing handle:
+    ///
+    /// - On Linux without `user_allow_other` privileges, dropping the
+    ///   FUSE session invokes `fusermount3` as a subprocess. That call
+    ///   blocks the dropping thread briefly. The `async fn` signature is
+    ///   kept for shape-symmetry with NFS rather than for non-blocking
+    ///   semantics on FUSE.
+    /// - On macOS, the `BackgroundSession` drop talks to the kernel
+    ///   directly through libfuse without a subprocess hop.
+    /// - `ProjFS` is fully kernel-mediated (`PrjStopVirtualizing`).
     ///
     /// Prefer this over relying on Drop when error handling matters (e.g.
     /// sidecar shutdown, CI cleanup, signal-handling paths). Drop stays as a
@@ -633,10 +683,11 @@ impl MountHandle {
             #[cfg(feature = "nfs")]
             Self::Nfs(h) => h.unmount().await,
             #[cfg(any(target_os = "linux", feature = "fuse"))]
-            Self::Fuse(session) => {
-                // fuser does not expose a Result-returning unmount; dropping
-                // the BackgroundSession is the documented shutdown path.
-                drop(session);
+            Self::Fuse(handle) => {
+                // fuser does not expose a Result-returning unmount;
+                // dropping the BackgroundSession is the documented
+                // shutdown path. On Linux this triggers fusermount3.
+                drop(handle.into_inner());
                 Ok(())
             }
             #[cfg(target_os = "windows")]
@@ -776,7 +827,7 @@ pub async fn mount(metadata: MetadataTree, config: &MountConfig) -> anyhow::Resu
         #[cfg(feature = "nfs")]
         Transport::Nfs => Ok(MountHandle::Nfs(mount_nfs(vfs, config).await?)),
         #[cfg(any(target_os = "linux", feature = "fuse"))]
-        Transport::Fuse => Ok(MountHandle::Fuse(mount_fuse(vfs, config)?)),
+        Transport::Fuse => Ok(MountHandle::Fuse(FuseHandle::new(mount_fuse(vfs, config)?))),
         #[cfg(target_os = "windows")]
         Transport::ProjFs => {
             let adapter = projfs_adapter::ProjFsAdapter::new(vfs);
