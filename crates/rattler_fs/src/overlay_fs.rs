@@ -226,12 +226,15 @@ impl<T: VfsOps> OverlayFS<T> {
             return Ok(());
         }
         let Some(lower_ino) = self.lower_ino_for_path(path) else {
+            tracing::warn!("auto-whiteout {:?}: no lower ino", path);
             return Ok(());
         };
         let Ok(attr) = self.lower.getattr(lower_ino) else {
+            tracing::warn!("auto-whiteout {:?}: lower getattr failed", path);
             return Ok(());
         };
         if attr.kind != FileKind::Directory {
+            tracing::warn!("auto-whiteout {:?}: not a directory", path);
             return Ok(());
         }
 
@@ -239,6 +242,7 @@ impl<T: VfsOps> OverlayFS<T> {
         {
             let state = self.state.lock_or_eio()?;
             if state.is_whiteout(path) {
+                tracing::warn!("auto-whiteout {:?}: already whiteout'd", path);
                 return Ok(());
             }
         }
