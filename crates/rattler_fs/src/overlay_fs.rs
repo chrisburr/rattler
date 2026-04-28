@@ -305,6 +305,14 @@ impl<T: VfsOps> OverlayFS<T> {
             .add_whiteout(path.to_path_buf())
             .map_err(|_e| EIO)?;
         self.invalidate_path_caches(path)?;
+
+        // Recurse: this dir was the last visible child of its parent, so
+        // the parent may now be logically empty too (pip's per-file rename
+        // order doesn't guarantee that grandchildren finish before their
+        // parent's last direct file moves out).
+        if let Some(parent) = path.parent() {
+            self.maybe_whiteout_empty_lower_dir(parent)?;
+        }
         Ok(())
     }
 
