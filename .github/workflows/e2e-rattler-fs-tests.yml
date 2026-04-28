@@ -146,7 +146,11 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: chrisburr/pixi
-          ref: feat/rattler-fs
+          # Pin to a SHA — checking out a moving branch combined with the
+          # regex-based path rewrite below means a benign rename in the
+          # fork could silently leave [patch.crates-io] entries
+          # un-rewritten and we'd build against the wrong rattler crates.
+          ref: e3e7a4dfd9b390c08c6482a9fc15a2f62fcca68a # feat/rattler-fs
           path: pixi-src
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
@@ -169,6 +173,27 @@ jobs:
           PY
           echo "--- Patched [patch.crates-io] paths:"
           grep -E 'path = "\.\./crates/' pixi-src/Cargo.toml || true
+      - name: Verify pixi fork patch rewrite
+        shell: bash
+        run: |
+          # Defensive: make sure the regex rewrite above actually fired
+          # AND consumed every rattler-pointing path. A benign rename in
+          # the fork (e.g. a crate add/move) could break the regex
+          # silently, leaving [patch.crates-io] entries pointing at the
+          # original chrisburr/rattler checkout instead of this PR's
+          # rattler tree.
+          rewritten=$(grep -cE 'path = "\.\./crates/' pixi-src/Cargo.toml || echo 0)
+          remaining=$(grep -cE 'path = "[^"]*rattler[/\\]' pixi-src/Cargo.toml || echo 0)
+          echo "rewritten=$rewritten remaining=$remaining"
+          if [ "$remaining" -ne 0 ]; then
+            echo "ERROR: $remaining unrewritten rattler-pointing path(s) survived in pixi Cargo.toml:" >&2
+            grep -nE 'path = "[^"]*rattler[/\\]' pixi-src/Cargo.toml >&2
+            exit 1
+          fi
+          if [ "$rewritten" -eq 0 ]; then
+            echo "ERROR: regex didn't rewrite anything — has the fork's [patch.crates-io] structure changed?" >&2
+            exit 1
+          fi
       - run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
 
   # ----- e2e-mount jobs (one per OS, gated only on its own rattler build) -----
@@ -301,7 +326,35 @@ jobs:
           rattler --help | head -5
       - name: Enable ProjFS
         shell: powershell
-        run: Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+        run: |
+          Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -NoRestart
+          # Verify the feature is actually enabled — without this, a
+          # silent failure or required reboot would let the e2e test run
+          # against a non-virtualised NTFS path and pass for the wrong
+          # reason.
+          $f = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+          Write-Host "ProjFS state: $($f.State); RestartNeeded: $($f.RestartNeeded)"
+          if ($f.State -ne 'Enabled') {
+            Write-Error "ProjFS state is '$($f.State)', expected 'Enabled'"
+            exit 1
+          }
+          if ($f.RestartNeeded) {
+            Write-Error "ProjFS reports RestartNeeded=$true; runner image needs an upgrade"
+            exit 1
+          }
+      - name: Verify ProjFS service is running
+        shell: powershell
+        run: |
+          $svc = Get-Service -Name PrjFlt -ErrorAction SilentlyContinue
+          if ($null -eq $svc) {
+            Write-Error "ProjFS filter driver service (PrjFlt) not found"
+            exit 1
+          }
+          Write-Host "PrjFlt status: $($svc.Status); start type: $($svc.StartType)"
+          if ($svc.Status -ne 'Running') {
+            Write-Error "PrjFlt service is '$($svc.Status)', expected 'Running'"
+            exit 1
+          }
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.rattler/cache/pkgs
