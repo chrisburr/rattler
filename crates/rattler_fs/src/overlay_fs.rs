@@ -423,6 +423,25 @@ impl<T: VfsOps> OverlayFS<T> {
         Some(current_ino)
     }
 
+    /// If `path` is a directory and an upper-layer counterpart exists, take
+    /// the later of the two mtimes. NFS3 clients invalidate cached `LOOKUP`
+    /// results when a parent directory's mtime changes; without this, an
+    /// in-memory whiteout that lands as a new `.wh.*` marker in upper would
+    /// not bump the lower-only stat's mtime and stale child lookups would
+    /// keep resolving through the kernel's positive name cache.
+    fn bump_dir_mtime_with_upper(&self, path: &Path, attr: &mut FileAttr) {
+        if attr.kind != FileKind::Directory {
+            return;
+        }
+        if let Ok(meta) = fs::metadata(self.upper_path(path)) {
+            if let Ok(upper_mtime) = meta.modified() {
+                if upper_mtime > attr.mtime {
+                    attr.mtime = upper_mtime;
+                }
+            }
+        }
+    }
+
     fn make_upper_attr(&self, path: &Path, ino: u64) -> Result<FileAttr, i32> {
         let full_path = self.upper_path(path);
         let metadata = fs::symlink_metadata(&full_path).map_err(|_e| ENOENT)?;
@@ -714,14 +733,20 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                     Ok(attr) => Ok(attr),
                     Err(_) => {
                         if let Some(lower_ino) = self.lower_ino_for_path(&path) {
-                            self.lower.getattr(lower_ino)
+                            let mut attr = self.lower.getattr(lower_ino)?;
+                            self.bump_dir_mtime_with_upper(&path, &mut attr);
+                            Ok(attr)
                         } else {
                             Err(ENOENT)
                         }
                     }
                 }
             }
-            ResolvedIno::Lower(lower_ino, _) => self.lower.getattr(lower_ino),
+            ResolvedIno::Lower(lower_ino, path) => {
+                let mut attr = self.lower.getattr(lower_ino)?;
+                self.bump_dir_mtime_with_upper(&path, &mut attr);
+                Ok(attr)
+            }
         }
     }
 
