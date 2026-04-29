@@ -157,11 +157,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: chrisburr/pixi
-          # Pin to a SHA — checking out a moving branch combined with the
-          # regex-based path rewrite below means a benign rename in the
-          # fork could silently leave [patch.crates-io] entries
-          # un-rewritten and we'd build against the wrong rattler crates.
-          ref: e3e7a4dfd9b390c08c6482a9fc15a2f62fcca68a # feat/rattler-fs
+          ref: feat/rattler-fs
           path: pixi-src
       # Cache target dir. On Linux the pixi env's activate_linux.sh redirects
       # CARGO_TARGET_DIR to .pixi/target (relative to PWD = rattler tree
