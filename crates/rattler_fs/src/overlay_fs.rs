@@ -439,6 +439,26 @@ impl<T: VfsOps> OverlayFS<T> {
                 );
                 EIO
             })?;
+
+            // Revive any whiteout'd ancestor of the new path. When the user
+            // creates content inside a directory that the auto-sweep (or an
+            // explicit rmdir) previously whiteout'd, the dir is logically
+            // "alive again" — drop the whiteout. If the dir also exists in
+            // lower, add an opaque marker to keep the old contents hidden.
+            let mut state = self.state.lock_or_eio()?;
+            let mut cur: Option<&Path> = Some(parent);
+            while let Some(p) = cur {
+                if p.as_os_str().is_empty() {
+                    break;
+                }
+                if state.is_whiteout(p) {
+                    state.remove_whiteout(p).map_err(|_e| EIO)?;
+                    if self.lower_ino_for_path(p).is_some() {
+                        state.add_opaque_dir(p.to_path_buf()).map_err(|_e| EIO)?;
+                    }
+                }
+                cur = p.parent();
+            }
         }
         Ok(())
     }
@@ -634,22 +654,40 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         };
         let virtual_path = parent_path.join(name);
 
-        // Single state lock: check whiteout and opaque in one acquisition
-        {
+        // Whiteout / ancestor-whiteout check. Ancestor walk is required
+        // because NFS clients can hold a parent inode cached from before its
+        // dir was whiteout'd; a later LOOKUP of a child by that cached parent
+        // inode bypasses the parent's own whiteout check (the parent inode
+        // resolves through `lower.ino_to_path`, which the lower layer always
+        // honors). Note: opaque parent is checked AFTER the upper-layer probe
+        // — opaque only suppresses lower content, not upper.
+        let parent_opaque = {
             let state = self.state.lock_or_eio()?;
             if state.is_whiteout(&virtual_path) {
                 return Err(ENOENT);
             }
-            if state.is_opaque(&parent_path) {
-                return Err(ENOENT);
+            let mut cur = parent_path.as_path();
+            loop {
+                if state.is_whiteout(cur) {
+                    return Err(ENOENT);
+                }
+                match cur.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => cur = p,
+                    _ => break,
+                }
             }
-        }
+            state.is_opaque(&parent_path)
+        };
 
         // Check upper layer — use symlink_metadata directly (avoids TOCTOU of exists + stat)
         let upper = self.upper_path(&virtual_path);
         if let Ok(metadata) = fs::symlink_metadata(&upper) {
             let ino = self.assign_upper_ino(virtual_path.clone())?;
             return Ok(FileAttr::from_metadata(&metadata, ino));
+        }
+
+        if parent_opaque {
+            return Err(ENOENT);
         }
 
         // Fall through to lower
