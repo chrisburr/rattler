@@ -213,14 +213,21 @@ impl PackageCacheLayer {
     }
 
     /// Validate the packages.
+    ///
+    /// Validation runs against the on-disk state at
+    /// `<layer-path>/<cache-key>`. Any in-memory revision/sha256 already
+    /// remembered for this key is also consulted as an optimization. The
+    /// in-memory entry is created on demand so that pre-populated layers
+    /// (read-only shared caches such as those exposed via CVMFS) can be
+    /// validated without first having flowed through this process.
     pub async fn try_validate(
         &self,
         cache_key: &CacheKey,
     ) -> Result<CacheMetadata, PackageCacheLayerError> {
         let cache_entry = self
             .packages
-            .get(&cache_key.clone().into())
-            .ok_or(PackageCacheLayerError::PackageNotFound)?
+            .entry(cache_key.clone().into())
+            .or_default()
             .clone();
         let mut cache_entry = cache_entry.lock().await;
         let cache_path = self.path.join(cache_key.to_string());
