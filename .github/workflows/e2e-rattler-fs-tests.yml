@@ -140,7 +140,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           submodules: recursive
+      # On Linux, build inside the rattler pixi env so we get conda-forge's
+      # gcc toolchain (manylinux_2_17, glibc 2.17), matching the rattler-bin
+      # job. The default Ubuntu runner toolchain links against glibc 2.39
+      # which is unusable on common targets like AlmaLinux 9 / lxplus.
+      # macOS and Windows have no equivalent glibc concern, so they keep
+      # using rustup directly.
+      - uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        if: runner.os == 'Linux'
+        with:
+          environments: default
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-04-26
+        if: runner.os != 'Linux'
         with:
           toolchain: "1.93.1"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -152,7 +163,18 @@ jobs:
           # un-rewritten and we'd build against the wrong rattler crates.
           ref: e3e7a4dfd9b390c08c6482a9fc15a2f62fcca68a # feat/rattler-fs
           path: pixi-src
+      # Cache target dir. On Linux the pixi env's activate_linux.sh redirects
+      # CARGO_TARGET_DIR to .pixi/target (relative to PWD = rattler tree
+      # root), so the cache key needs to point there. macOS/Windows use the
+      # default pixi-src/target.
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        if: runner.os == 'Linux'
+        with:
+          workspaces: . -> .pixi/target
+          key: pixi-${{ matrix.os }}-pixi-env
+          shared-key: pixi-${{ matrix.os }}-pixi-env
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        if: runner.os != 'Linux'
         with:
           workspaces: pixi-src -> target
           key: pixi-${{ matrix.os }}
@@ -194,13 +216,27 @@ jobs:
             echo "ERROR: regex didn't rewrite anything — has the fork's [patch.crates-io] structure changed?" >&2
             exit 1
           fi
-      - run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
+      # Linux: build inside pixi env. -static-libgcc embeds libgcc_s so the
+      # binary doesn't depend on the builder's GCC runtime symbol versions
+      # (mirrors the build-rattler-linux RUSTFLAGS).
+      - name: Build pixi (Linux)
+        if: runner.os == 'Linux'
+        run: pixi run -e default cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
+        env:
+          RUSTFLAGS: "-C link-arg=-static-libgcc"
+      - name: Build pixi (macOS / Windows)
+        if: runner.os != 'Linux'
+        run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
       - name: Stage pixi
         shell: bash
         run: |
           mkdir -p bin-staging
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp pixi-src/target/release/pixi.exe bin-staging/
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            # pixi env's activate redirects CARGO_TARGET_DIR to .pixi/target.
+            cp .pixi/target/release/pixi bin-staging/
+            chmod +x bin-staging/pixi
           else
             cp pixi-src/target/release/pixi bin-staging/
             chmod +x bin-staging/pixi

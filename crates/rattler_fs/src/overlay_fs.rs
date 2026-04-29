@@ -423,6 +423,30 @@ impl<T: VfsOps> OverlayFS<T> {
         Some(current_ino)
     }
 
+    /// True if `path` itself or any ancestor has a whiteout marker.
+    /// Inode-driven operations (getattr, readdir, open) must honor this:
+    /// NFS clients can hold a cached inode for a path that was whiteout'd
+    /// after the kernel learned of it, and would otherwise reach lower
+    /// content directly without going through `lookup`.
+    fn path_or_ancestor_is_whiteout(&self, path: &Path) -> Result<bool, i32> {
+        let state = self.state.lock_or_eio()?;
+        let mut cur = path;
+        loop {
+            if state.is_whiteout(cur) {
+                tracing::warn!(
+                    "path_or_ancestor whiteout hit on {:?} for path {:?}",
+                    cur,
+                    path
+                );
+                return Ok(true);
+            }
+            match cur.parent() {
+                Some(p) if !p.as_os_str().is_empty() => cur = p,
+                _ => return Ok(false),
+            }
+        }
+    }
+
     /// If `path` is a directory and an upper-layer counterpart exists, take
     /// the later of the two mtimes. NFS3 clients invalidate cached `LOOKUP`
     /// results when a parent directory's mtime changes; without this, an
@@ -728,6 +752,9 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
     fn getattr(&self, ino: u64) -> Result<FileAttr, i32> {
         match self.resolve_ino(ino)? {
             ResolvedIno::Upper(path) => {
+                if self.path_or_ancestor_is_whiteout(&path)? {
+                    return Err(ENOENT);
+                }
                 // Try upper first, fall through to lower if it's just a structural dir
                 match self.make_upper_attr(&path, ino) {
                     Ok(attr) => Ok(attr),
@@ -743,6 +770,9 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 }
             }
             ResolvedIno::Lower(lower_ino, path) => {
+                if self.path_or_ancestor_is_whiteout(&path)? {
+                    return Err(ENOENT);
+                }
                 let mut attr = self.lower.getattr(lower_ino)?;
                 self.bump_dir_mtime_with_upper(&path, &mut attr);
                 Ok(attr)
@@ -888,6 +918,9 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
             }
             ResolvedIno::Lower(li, p) => (p, Some(li)),
         };
+        if self.path_or_ancestor_is_whiteout(&dir_path)? {
+            return Err(ENOENT);
+        }
         let state = self.state.lock_or_eio()?;
 
         // Collect entries by name — upper overrides lower
@@ -1128,6 +1161,12 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         let virtual_path = self.resolve_path(parent, name)?;
         let upper_path = self.upper_path(&virtual_path);
 
+        // Revive whiteout'd ancestors (matches ensure_upper_parent semantics).
+        // This is needed for the rmdir-then-mkdir pattern — if a previous
+        // auto-sweep recursively whiteout'd a parent dir, this mkdir's path
+        // would otherwise stay invisible behind that ancestor whiteout.
+        self.ensure_upper_parent(&virtual_path)?;
+
         fs::create_dir_all(&upper_path).map_err(|e| {
             tracing::warn!("mkdir failed {:?}: {}", upper_path, e);
             EIO
@@ -1324,9 +1363,17 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
                 .rename_path(&src_path, dst_path);
         }
 
-        // Drop cached lower→ino mapping for the source path (it now
-        // points nowhere from the user's view) and any promoted redirect.
-        self.invalidate_path_caches(&src_path)?;
+        // Drop the lower→ino path-cache entry for the moved-out source so
+        // a fresh `lower_ino_for_path` doesn't keep pointing at a path that
+        // no longer represents the file. The `promoted` redirect must NOT
+        // be dropped here — for a rename it now resolves the original lower
+        // inode to the upper destination, which is exactly what callers
+        // holding a stale lower-inode handle (e.g. an open fd) need to keep
+        // working after the move. (`invalidate_path_caches` is only correct
+        // for true destruction in unlink/rmdir.)
+        if let Some(mut cache) = self.lower_ino_cache.lock_or_none() {
+            cache.remove(&src_path);
+        }
 
         if src_in_lower {
             if let Some(src_parent) = src_path.parent() {
@@ -2805,18 +2852,22 @@ mod tests {
             ENOENT
         );
 
-        // readdir should be empty (whiteouts still active)
-        let entries = ofs.readdir(python.ino, 0).unwrap();
-        let names: Vec<_> = entries
-            .iter()
-            .filter(|e| e.name != "." && e.name != "..")
-            .collect();
-        assert!(names.is_empty(), "lower layer bled through: {names:?}");
+        // After step-4 unlinks, the auto-whiteout sweep promotes
+        // `lib/python` to a parent-level whiteout (its only lower children
+        // are now whiteout'd and upper holds nothing real). Inode-driven
+        // access via the stale lower ino must therefore fail with ENOENT —
+        // matches a real fs after rmdir-then-recreate, and is what blocks
+        // the kernel from serving cached lower-inode access on whiteout'd
+        // directories.
+        assert_eq!(ofs.readdir(python.ino, 0).unwrap_err(), ENOENT);
 
-        // Whiteouts should be persisted
+        // Whiteouts should be persisted (auto-sweep keeps the per-child
+        // whiteouts alongside the parent one — they are cheaper to keep
+        // than to retrofit during a re-revival).
         let state = ofs.state.lock().unwrap();
         assert!(state.is_whiteout(Path::new("lib/python/foo.py")));
         assert!(state.is_whiteout(Path::new("lib/python/bar.py")));
+        assert!(state.is_whiteout(Path::new("lib/python")));
     }
 
     // --- Symlink COW regression test ---
