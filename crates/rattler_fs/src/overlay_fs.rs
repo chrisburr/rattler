@@ -1323,12 +1323,32 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
         // and the on-disk markers stay in sync as long as we go through
         // the API.
         let src_in_lower = self.lower_ino_for_path(&src_path).is_some();
+        // Detect the rmdir-then-rename-back pattern (e.g.
+        // `mv pytest xxx; rm -rf xxx/*; mv xxx pytest`). When the dst path
+        // had a whiteout that was hiding a lower-layer directory, simply
+        // dropping the whiteout would let the lower children re-emerge —
+        // we never recorded per-child whiteouts because the dir-level
+        // whiteout was supposed to subsume them. If the rename leaves a
+        // directory at dst (in upper) and lower still has a directory
+        // there, set an opaque marker so the lower content stays hidden,
+        // matching the rmdir-then-mkdir path that mkdir already handles.
+        let dst_lower_is_dir = self
+            .lower_ino_for_path(&dst_path)
+            .and_then(|ino| self.lower.getattr(ino).ok())
+            .map(|a| a.kind == FileKind::Directory)
+            .unwrap_or(false);
+        let dst_upper_is_dir = fs::symlink_metadata(&upper_dst)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         let mut state = self.state.lock_or_eio()?;
         if src_in_lower {
             state.add_whiteout(src_path.clone()).map_err(|_e| EIO)?;
         }
         if state.is_whiteout(&dst_path) {
             state.remove_whiteout(&dst_path).map_err(|_e| EIO)?;
+            if dst_lower_is_dir && dst_upper_is_dir {
+                state.add_opaque_dir(dst_path.clone()).map_err(|_e| EIO)?;
+            }
         }
         drop(state);
 
@@ -2847,6 +2867,73 @@ mod tests {
         assert!(state.is_whiteout(Path::new("lib/python/foo.py")));
         assert!(state.is_whiteout(Path::new("lib/python/bar.py")));
         assert!(state.is_whiteout(Path::new("lib/python")));
+    }
+
+    /// Regression: `mv lib/python lib/xxx; rm -rf lib/xxx/*; mv lib/xxx lib/python`.
+    /// The first rename adds a single dir-level whiteout for `lib/python` and
+    /// no per-child whiteouts (the dir whiteout subsumes them). The upper-only
+    /// emptying of `lib/xxx` records nothing in lower state. The final rename
+    /// removes the `lib/python` whiteout — without an opaque-on-revival marker
+    /// the lower files would re-emerge through the now-empty upper dir.
+    #[test]
+    fn test_rename_back_over_dir_whiteout_keeps_lower_hidden() {
+        let tmp = TempDir::new().unwrap();
+        let overlay_dir = tmp.path().join("upper");
+        let ofs = OverlayFS::new(
+            MockLowerWithFiles,
+            overlay_dir,
+            "hash".into(),
+            "test".into(),
+        )
+        .unwrap();
+
+        // MockLowerWithFiles: lib(2) → python(3) → {foo.py(4), bar.py(5)}
+        let lib = ofs.lookup(1, OsStr::new("lib")).unwrap();
+        assert!(ofs
+            .lookup(
+                ofs.lookup(lib.ino, OsStr::new("python")).unwrap().ino,
+                OsStr::new("foo.py")
+            )
+            .is_ok());
+
+        // Step 1: mv lib/python lib/xxx (lower-source dir rename — adds a
+        // single dir-level whiteout for lib/python; foo.py/bar.py are COW'd
+        // into upper/lib/xxx but receive no individual whiteouts).
+        ofs.rename(lib.ino, OsStr::new("python"), lib.ino, OsStr::new("xxx"), 0)
+            .unwrap();
+        let xxx = ofs.lookup(lib.ino, OsStr::new("xxx")).unwrap();
+
+        // Step 2: rm -rf lib/xxx/* — empty the upper-only dir. These unlinks
+        // touch nothing in lower state because lib/xxx isn't a lower path.
+        ofs.unlink(xxx.ino, OsStr::new("foo.py")).unwrap();
+        ofs.unlink(xxx.ino, OsStr::new("bar.py")).unwrap();
+
+        // Step 3: mv lib/xxx lib/python — rename the empty dir back over the
+        // whiteout. The opaque-on-revival logic should keep lower hidden.
+        ofs.rename(lib.ino, OsStr::new("xxx"), lib.ino, OsStr::new("python"), 0)
+            .unwrap();
+
+        let new_python = ofs.lookup(lib.ino, OsStr::new("python")).unwrap();
+        assert_eq!(
+            ofs.lookup(new_python.ino, OsStr::new("foo.py"))
+                .unwrap_err(),
+            ENOENT
+        );
+        assert_eq!(
+            ofs.lookup(new_python.ino, OsStr::new("bar.py"))
+                .unwrap_err(),
+            ENOENT
+        );
+        let entries = ofs.readdir(new_python.ino, 0).unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .map(|e| e.name.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "lower bled through after rename-back: {names:?}"
+        );
     }
 
     // --- Symlink COW regression test ---
