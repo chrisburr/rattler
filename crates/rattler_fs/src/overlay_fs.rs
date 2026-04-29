@@ -763,18 +763,37 @@ impl<T: VfsOps> VfsOps for OverlayFS<T> {
     /// the lower→upper promotion redirect so a pre-COW open keeps seeing its
     /// original inode's attrs. See [`Self::resolve_ino_inner`] for why.
     fn getattr_strict(&self, ino: u64) -> Result<FileAttr, i32> {
+        // Same ancestor-whiteout + upper-mtime-blend logic as `getattr`.
+        // The NFS adapter routes every NFS3 GETATTR through this path
+        // (nfs_adapter.rs:480), and a kernel that cached a LOOKUP for a
+        // since-whiteout'd path can issue GETATTR on that cached fh
+        // without re-LOOKUPing first — `getattr` alone wouldn't catch it.
         match self.resolve_ino_inner(ino, false)? {
-            ResolvedIno::Upper(path) => match self.make_upper_attr(&path, ino) {
-                Ok(attr) => Ok(attr),
-                Err(_) => {
-                    if let Some(lower_ino) = self.lower_ino_for_path(&path) {
-                        self.lower.getattr_strict(lower_ino)
-                    } else {
-                        Err(ENOENT)
+            ResolvedIno::Upper(path) => {
+                if self.path_or_ancestor_is_whiteout(&path)? {
+                    return Err(ENOENT);
+                }
+                match self.make_upper_attr(&path, ino) {
+                    Ok(attr) => Ok(attr),
+                    Err(_) => {
+                        if let Some(lower_ino) = self.lower_ino_for_path(&path) {
+                            let mut attr = self.lower.getattr_strict(lower_ino)?;
+                            self.bump_dir_mtime_with_upper(&path, &mut attr);
+                            Ok(attr)
+                        } else {
+                            Err(ENOENT)
+                        }
                     }
                 }
-            },
-            ResolvedIno::Lower(lower_ino, _) => self.lower.getattr_strict(lower_ino),
+            }
+            ResolvedIno::Lower(lower_ino, path) => {
+                if self.path_or_ancestor_is_whiteout(&path)? {
+                    return Err(ENOENT);
+                }
+                let mut attr = self.lower.getattr_strict(lower_ino)?;
+                self.bump_dir_mtime_with_upper(&path, &mut attr);
+                Ok(attr)
+            }
         }
     }
 
@@ -2934,6 +2953,52 @@ mod tests {
             names.is_empty(),
             "lower bled through after rename-back: {names:?}"
         );
+    }
+
+    /// Regression: NFS3 GETATTR routes through `getattr_strict` (see
+    /// `nfs_adapter.rs:480`). A kernel that cached a LOOKUP for a path that
+    /// has since been whiteout'd may issue GETATTR on the cached fh without
+    /// re-LOOKUPing — so the same ancestor-whiteout walk must apply there
+    /// too, otherwise the cached lower inode resolves straight back to lower
+    /// attrs and Python's PEP 420 importer treats the directory as a
+    /// namespace package.
+    #[test]
+    fn test_getattr_strict_blocks_stale_inode_through_whiteoutd_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let overlay_dir = tmp.path().join("upper");
+        let ofs = OverlayFS::new(
+            MockLowerWithFiles,
+            overlay_dir,
+            "hash".into(),
+            "test".into(),
+        )
+        .unwrap();
+
+        // Capture stale lower inodes BEFORE any mutation.
+        let lib = ofs.lookup(1, OsStr::new("lib")).unwrap();
+        let python = ofs.lookup(lib.ino, OsStr::new("python")).unwrap();
+        let foo = ofs.lookup(python.ino, OsStr::new("foo.py")).unwrap();
+        let stale_python = python.ino;
+        let stale_foo = foo.ino;
+
+        // Simulate `pip uninstall pytest` semantics on lib/python: unlink
+        // both files, which the auto-sweep promotes to a parent-level
+        // whiteout for lib/python (last visible child gone, upper holds
+        // only `.wh.*` markers).
+        ofs.unlink(python.ino, OsStr::new("foo.py")).unwrap();
+        ofs.unlink(python.ino, OsStr::new("bar.py")).unwrap();
+        assert!(ofs
+            .state
+            .lock()
+            .unwrap()
+            .is_whiteout(Path::new("lib/python")));
+
+        // The stale lower inodes the kernel may still hold cached must now
+        // resolve to ENOENT through getattr_strict — both for the dir
+        // itself and for any child resolved via its (now-whiteout'd)
+        // ancestor.
+        assert_eq!(ofs.getattr_strict(stale_python).unwrap_err(), ENOENT);
+        assert_eq!(ofs.getattr_strict(stale_foo).unwrap_err(), ENOENT);
     }
 
     // --- Symlink COW regression test ---
