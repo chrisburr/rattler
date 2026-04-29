@@ -226,15 +226,12 @@ impl<T: VfsOps> OverlayFS<T> {
             return Ok(());
         }
         let Some(lower_ino) = self.lower_ino_for_path(path) else {
-            tracing::warn!("auto-whiteout {:?}: no lower ino", path);
             return Ok(());
         };
         let Ok(attr) = self.lower.getattr(lower_ino) else {
-            tracing::warn!("auto-whiteout {:?}: lower getattr failed", path);
             return Ok(());
         };
         if attr.kind != FileKind::Directory {
-            tracing::warn!("auto-whiteout {:?}: not a directory", path);
             return Ok(());
         }
 
@@ -242,7 +239,6 @@ impl<T: VfsOps> OverlayFS<T> {
         {
             let state = self.state.lock_or_eio()?;
             if state.is_whiteout(path) {
-                tracing::warn!("auto-whiteout {:?}: already whiteout'd", path);
                 return Ok(());
             }
         }
@@ -256,11 +252,6 @@ impl<T: VfsOps> OverlayFS<T> {
                     continue;
                 }
                 if !state.is_whiteout(&path.join(&entry.name)) {
-                    tracing::warn!(
-                        "auto-whiteout {:?}: lower child {:?} still visible",
-                        path,
-                        entry.name
-                    );
                     return Ok(());
                 }
             }
@@ -270,18 +261,11 @@ impl<T: VfsOps> OverlayFS<T> {
         let upper = self.upper_path(path);
         if let Ok(read_dir) = fs::read_dir(&upper) {
             for entry in read_dir.flatten() {
-                let name = entry.file_name();
-                if !is_overlay_internal_name(&name) {
-                    tracing::warn!(
-                        "auto-whiteout {:?}: upper has non-internal {:?}",
-                        path,
-                        name
-                    );
+                if !is_overlay_internal_name(&entry.file_name()) {
                     return Ok(());
                 }
             }
         }
-        tracing::warn!("auto-whiteout {:?}: sweeping", path);
 
         // Strip on-disk markers (so `remove_dir` succeeds) but leave the
         // in-memory child whiteouts intact — `clear_dir_markers` would also
@@ -433,11 +417,6 @@ impl<T: VfsOps> OverlayFS<T> {
         let mut cur = path;
         loop {
             if state.is_whiteout(cur) {
-                tracing::warn!(
-                    "path_or_ancestor whiteout hit on {:?} for path {:?}",
-                    cur,
-                    path
-                );
                 return Ok(true);
             }
             match cur.parent() {

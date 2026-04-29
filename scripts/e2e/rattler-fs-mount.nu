@@ -337,27 +337,8 @@ if $use_overlay {
             ^$python_path -m pip uninstall -y pytest
         }))
 
-        # Diagnostic: dump what python sees at the pytest path
-        let diag_py = $"($tmp)/pytest_diag.py"
-        let sp_dir = $"($mount_point)/lib/python3.12/site-packages"
-        let diag_src = "import os, sys
-sp = sys.argv[1]
-print('DIAG sp_listdir_pytest:', sorted(n for n in os.listdir(sp) if 'pytest' in n.lower()))
-p = sp + '/pytest'
-try:
-    print('DIAG pytest_stat:', os.stat(p))
-except Exception as e:
-    print('DIAG pytest_stat_err:', e)
-try:
-    print('DIAG pytest_listdir:', os.listdir(p)[:20])
-except Exception as e:
-    print('DIAG pytest_listdir_err:', e)
-"
-        $diag_src | save -f $diag_py
-        try { ^$python_path $diag_py $sp_dir | print } catch { |err| print $"  diag err: ($err.msg)" }
-
         $results = ($results | append (expect_fail "import pytest after uninstall" {
-            ^$python_path -c "import sys; import pytest; print('FILE=', pytest.__file__); print('PATH=', list(pytest.__path__) if hasattr(pytest, '__path__') else None); sys.exit(0)"
+            ^$python_path -c "import pytest"
         }))
     }
 
@@ -687,8 +668,6 @@ if $use_overlay and $transport != "projfs" {
 try { ^timeout 5 rm -rf $mount_point } catch { }
 
 if not $all_ok {
-    print "\n== rattler mount log: auto-whiteout traces (if any):"
-    try { open $log_file | lines | where ($it | str contains "auto-whiteout") | each { |l| print $l } } catch { }
     print "\n== rattler mount log tail:"
     try { open $log_file | lines | last 30 | each { |l| print $l } } catch { }
     exit 1
