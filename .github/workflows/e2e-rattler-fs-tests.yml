@@ -195,6 +195,22 @@ jobs:
             exit 1
           fi
       - run: cargo build --release --manifest-path pixi-src/Cargo.toml -p pixi
+      - name: Stage pixi
+        shell: bash
+        run: |
+          mkdir -p bin-staging
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp pixi-src/target/release/pixi.exe bin-staging/
+          else
+            cp pixi-src/target/release/pixi bin-staging/
+            chmod +x bin-staging/pixi
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pixi-fork-${{ matrix.os }}
+          path: bin-staging/
+          retention-days: 1
+          if-no-files-found: error
 
   # ----- e2e-mount jobs (one per OS, gated only on its own rattler build) -----
 
