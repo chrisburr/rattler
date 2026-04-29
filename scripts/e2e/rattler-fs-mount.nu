@@ -337,8 +337,27 @@ if $use_overlay {
             ^$python_path -m pip uninstall -y pytest
         }))
 
+        # Diagnostic: dump what python sees at the pytest path
+        let diag_py = $"($tmp)/pytest_diag.py"
+        let sp_dir = $"($mount_point)/lib/python3.12/site-packages"
+        $"
+import os
+sp = '($sp_dir)'
+print('DIAG sp_listdir_pytest:', sorted(n for n in os.listdir(sp) if 'pytest' in n.lower()))
+p = sp + '/pytest'
+try:
+    print('DIAG pytest_stat:', os.stat(p))
+except Exception as e:
+    print('DIAG pytest_stat_err:', e)
+try:
+    print('DIAG pytest_listdir:', os.listdir(p)[:20])
+except Exception as e:
+    print('DIAG pytest_listdir_err:', e)
+" | save -f $diag_py
+        try { ^$python_path $diag_py | print } catch { |err| print $"  diag err: ($err.msg)" }
+
         $results = ($results | append (expect_fail "import pytest after uninstall" {
-            ^$python_path -c "import pytest"
+            ^$python_path -c "import sys; import pytest; print('FILE=', pytest.__file__); print('PATH=', list(pytest.__path__) if hasattr(pytest, '__path__') else None); sys.exit(0)"
         }))
     }
 
