@@ -8,6 +8,7 @@ on:
       - scripts/e2e/rattler-fs-mount.nu
       - test-data/rattler-fs/**
       - .github/workflows/e2e-rattler-fs-tests.yml
+  workflow_dispatch:
 
 name: E2E rattler-fs Mount Tests
 
