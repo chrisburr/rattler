@@ -133,8 +133,12 @@ impl CacheGlobalLock {
 /// This struct manages access to a `.lock` file that stores metadata about a cache entry,
 /// including its revision number and optional SHA256 hash. It does not provide filesystem
 /// locking - concurrent access should be coordinated via [`CacheGlobalLock`].
+///
+/// The handle may be backed by no file at all when the layer is read-only and the
+/// metadata file is absent or cannot be opened — in that case reads return defaults
+/// and writes are rejected.
 pub struct CacheMetadataFile {
-    file: Arc<std::fs::File>,
+    file: Option<Arc<std::fs::File>>,
 }
 
 impl CacheMetadataFile {
@@ -164,10 +168,35 @@ impl CacheMetadataFile {
                 })?;
 
             Ok(CacheMetadataFile {
-                file: Arc::new(file),
+                file: Some(Arc::new(file)),
             })
         })
         .await
+    }
+
+    /// Acquires a read-only handle to the cache metadata file.
+    ///
+    /// Opens the file without creating it and without requesting write access, so it
+    /// works for layers stored on read-only filesystems (e.g. CVMFS, NFS-RO,
+    /// squashfs). When the file cannot be opened — because it does not exist or the
+    /// open is otherwise rejected — a handle with no underlying file is returned;
+    /// subsequent reads then yield defaults (revision `0`, no sha256). Writes are
+    /// rejected for read-only handles.
+    pub async fn acquire_readonly(path: &Path) -> Self {
+        let lock_file_path = path.to_path_buf();
+
+        let file: Result<Option<std::fs::File>, PackageCacheLayerError> =
+            simple_spawn_blocking::tokio::run_blocking_task(move || {
+                Ok(std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&lock_file_path)
+                    .ok())
+            })
+            .await;
+
+        CacheMetadataFile {
+            file: file.ok().flatten().map(Arc::new),
+        }
     }
 }
 
@@ -177,7 +206,12 @@ impl CacheMetadataFile {
         revision: u64,
         sha256: Option<&Sha256Hash>,
     ) -> Result<(), PackageCacheLayerError> {
-        let file = self.file.clone();
+        let Some(file) = self.file.clone() else {
+            return Err(PackageCacheLayerError::LockError(
+                "cannot write to a read-only cache metadata handle".to_string(),
+                std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
+            ));
+        };
 
         let sha256 = sha256.cloned();
         simple_spawn_blocking::tokio::run_blocking_task(move || {
@@ -237,14 +271,17 @@ impl CacheMetadataFile {
 
     /// Reads the revision from the cache metadata file.
     pub fn read_revision(&mut self) -> Result<u64, PackageCacheLayerError> {
-        (&*self.file).rewind().map_err(|e| {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(0);
+        };
+        (&**file).rewind().map_err(|e| {
             PackageCacheLayerError::LockError(
                 "failed to rewind cache lock for reading revision".to_string(),
                 e,
             )
         })?;
         let mut buf = [0; 8];
-        match (&*self.file).read_exact(&mut buf) {
+        match (&**file).read_exact(&mut buf) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(0);
@@ -263,14 +300,17 @@ impl CacheMetadataFile {
     pub fn read_sha256(&mut self) -> Result<Option<Sha256Hash>, PackageCacheLayerError> {
         const SHA256_LEN: usize = 32;
         const REVISION_LEN: u64 = 8;
-        (&*self.file).rewind().map_err(|e| {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(None);
+        };
+        (&**file).rewind().map_err(|e| {
             PackageCacheLayerError::LockError(
                 "failed to rewind cache lock for reading sha256".to_string(),
                 e,
             )
         })?;
         let mut buf = [0; SHA256_LEN];
-        let _ = (&*self.file)
+        let _ = (&**file)
             .seek(SeekFrom::Start(REVISION_LEN))
             .map_err(|e| {
                 PackageCacheLayerError::LockError(
@@ -278,7 +318,7 @@ impl CacheMetadataFile {
                     e,
                 )
             })?;
-        match (&*self.file).read_exact(&mut buf) {
+        match (&**file).read_exact(&mut buf) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(None);

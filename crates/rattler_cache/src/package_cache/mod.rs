@@ -671,19 +671,31 @@ where
         PathBuf::from(path_str)
     };
 
-    // Ensure the directory containing the lock-file exists.
-    if let Some(root_dir) = lock_file_path.parent() {
-        tokio_fs::create_dir_all(root_dir)
-            .map_err(|e| {
-                PackageCacheLayerError::LockError(
-                    format!("failed to create cache directory: '{}'", root_dir.display()),
-                    e,
-                )
-            })
-            .await?;
+    // Ensure the directory containing the lock-file exists. Skip this when we
+    // have no fetch function, since in that mode we are only validating an
+    // existing layer and the layer may live on a read-only filesystem.
+    if fetch.is_some() {
+        if let Some(root_dir) = lock_file_path.parent() {
+            tokio_fs::create_dir_all(root_dir)
+                .map_err(|e| {
+                    PackageCacheLayerError::LockError(
+                        format!("failed to create cache directory: '{}'", root_dir.display()),
+                        e,
+                    )
+                })
+                .await?;
+        }
     }
 
-    let mut metadata = CacheMetadataFile::acquire(&lock_file_path).await?;
+    // Open the metadata file in read-only mode when we have no fetch
+    // function — required for layers backed by a read-only filesystem
+    // (CVMFS, NFS-RO, squashfs). Read-only acquisition tolerates a missing
+    // metadata file by returning a handle that yields default values.
+    let mut metadata = if fetch.is_some() {
+        CacheMetadataFile::acquire(&lock_file_path).await?
+    } else {
+        CacheMetadataFile::acquire_readonly(&lock_file_path).await
+    };
     let cache_revision = metadata.read_revision()?;
     let locked_sha256 = metadata.read_sha256()?;
 
