@@ -38,6 +38,41 @@ mod cache_key;
 mod cache_lock;
 mod reporter;
 
+/// Returns `Some(true)` if `path` resides on a read-only mount, `Some(false)`
+/// if it is on a writable mount, and `None` if the read-only flag could not
+/// be determined for the current platform or path.
+#[cfg(unix)]
+fn mount_is_readonly(path: &Path) -> Option<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // statvfs requires an existing path. Walk up to the nearest existing
+    // ancestor; the mount flag is a property of the filesystem, not the
+    // specific entry.
+    let mut probe = path;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return None,
+        }
+    }
+
+    let c_path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid nul-terminated C string; stat is a valid
+    // mutable reference to a zeroed statvfs struct of the correct type.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    Some((stat.f_flag as u64 & libc::ST_RDONLY as u64) != 0)
+}
+
+#[cfg(not(unix))]
+fn mount_is_readonly(_path: &Path) -> Option<bool> {
+    None
+}
+
 /// A [`PackageCache`] manages a cache of extracted Conda packages on disk.
 ///
 /// The store does not provide an implementation to get the data into the store.
@@ -60,6 +95,7 @@ pub struct PackageCacheLayer {
     path: PathBuf,
     packages: DashMap<BucketKey, Arc<tokio::sync::Mutex<Entry>>>,
     validation_mode: ValidationMode,
+    cached_readonly: std::sync::OnceLock<bool>,
 }
 
 /// A key that defines the actual location of the package in the cache.
@@ -153,11 +189,27 @@ impl From<PackageCacheLayerError> for PackageCacheError {
 }
 
 impl PackageCacheLayer {
-    /// Determine if the layer is read-only in the filesystem
+    /// Determine if the layer is read-only in the filesystem.
+    ///
+    /// Considers both Unix permission bits and (on Unix) the read-only mount
+    /// flag reported by `statvfs` (`ST_RDONLY`). The latter is essential for
+    /// detecting read-only mounts such as CVMFS, NFS-RO, or squashfs, where
+    /// the directory's mode bits may still appear writable.
+    ///
+    /// The result is computed once and cached for the lifetime of the layer.
     pub fn is_readonly(&self) -> bool {
-        self.path
-            .metadata()
-            .is_ok_and(|m| m.permissions().readonly())
+        *self.cached_readonly.get_or_init(|| {
+            // First check filesystem permissions on the directory itself.
+            if let Ok(metadata) = self.path.metadata() {
+                if metadata.permissions().readonly() {
+                    return true;
+                }
+            }
+            // Then consult the mount-level read-only flag. This catches
+            // filesystems mounted read-only where the inode mode bits still
+            // look writable (CVMFS, squashfs, NFS-RO, etc.).
+            mount_is_readonly(&self.path).unwrap_or(false)
+        })
     }
 
     /// Validate the packages.
@@ -305,6 +357,7 @@ impl PackageCache {
                 path: path.into(),
                 packages: DashMap::default(),
                 validation_mode,
+                cached_readonly: std::sync::OnceLock::new(),
             })
             .collect();
 
