@@ -1,0 +1,10 @@
+[workspace]
+name = "rattler-fs-e2e"
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26,<3"
+pip = ">=24,<27"
+pytest = ">=8"
