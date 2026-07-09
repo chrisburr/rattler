@@ -872,6 +872,32 @@ pub fn copy_and_replace_textual_placeholder(
     Ok(())
 }
 
+/// Writes `source[start..end]` to `destination`, returning an [`std::io::ErrorKind::InvalidData`]
+/// error instead of panicking when the range is invalid (out of bounds or out of order).
+///
+/// The offsets driving the prefix replacement come from a package's `paths.json`, which is not
+/// trusted input. A malformed or malicious entry (an offset past the end of the file, or offsets
+/// that are not sorted/overlapping) must surface as a recoverable error rather than crash the
+/// process (which for e.g. a FUSE/NFS mount would take down the whole mount).
+fn write_replacement_range<W: Write>(
+    destination: &mut W,
+    source: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<(), std::io::Error> {
+    let slice = source.get(start..end).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid prefix replacement offsets: range {start}..{end} is out of bounds or out \
+                 of order for content of length {}",
+                source.len()
+            ),
+        )
+    })?;
+    destination.write_all(slice)
+}
+
 /// Given the contents of a file copy it to the `destination` and in the process replace the
 /// `prefix_placeholder` text with the `target_prefix` text using the offsets from the paths.json
 ///
@@ -880,7 +906,7 @@ pub fn copy_and_replace_textual_placeholder(
 /// important. See [`copy_and_replace_cstring_placeholder`] when you are dealing with binary
 /// content.
 pub fn copy_and_replace_textual_placeholder_offsets(
-    mut source_bytes: &[u8],
+    source_bytes: &[u8],
     mut destination: impl Write,
     prefix_placeholder: &str,
     target_prefix: &str,
@@ -890,27 +916,38 @@ pub fn copy_and_replace_textual_placeholder_offsets(
     let old_prefix = prefix_placeholder.as_bytes();
     let new_prefix = target_prefix.as_bytes();
 
-    // check if we have a shebang. We need to handle it differently because it has a maximum length
-    // that can be exceeded in very long target prefix's.
+    // The `offsets` are absolute byte positions within `source_bytes`, exactly as
+    // recorded in paths.json (including any occurrence inside the shebang line).
+    //
+    // When the file starts with a shebang we rewrite that first line separately
+    // because it has a maximum length that can be exceeded by very long target
+    // prefixes. We must therefore keep applying the remaining offsets against the
+    // original byte positions (rather than a shebang-stripped view) and skip any
+    // offset that falls inside the shebang line, since it has already been handled.
+    let mut shebang_end = 0;
     if target_platform.is_unix() && source_bytes.starts_with(b"#!") {
-        // extract first line
-        let (first, rest) =
-            source_bytes.split_at(source_bytes.iter().position(|&c| c == b'\n').unwrap_or(0));
-        let first_line = String::from_utf8_lossy(first);
+        // extract the first line (everything up to, but not including, the newline)
+        shebang_end = source_bytes
+            .iter()
+            .position(|&c| c == b'\n')
+            .unwrap_or(source_bytes.len());
+        let first_line = String::from_utf8_lossy(&source_bytes[..shebang_end]);
         let new_shebang = replace_shebang(
             first_line,
             (prefix_placeholder, target_prefix),
             target_platform,
         );
-        // let replaced = first_line.replace(prefix_placeholder, target_prefix);
         destination.write_all(new_shebang.as_bytes())?;
-        source_bytes = rest;
     }
 
-    let mut last_match = 0;
+    let mut last_match = shebang_end;
 
     for &offset in offsets {
-        destination.write_all(&source_bytes[last_match..offset])?;
+        // Offsets inside the shebang line have already been handled above.
+        if offset < shebang_end {
+            continue;
+        }
+        write_replacement_range(&mut destination, source_bytes, last_match, offset)?;
         destination.write_all(new_prefix)?;
         last_match = offset + old_prefix.len();
     }
@@ -1029,12 +1066,18 @@ pub fn copy_and_replace_cstring_placeholder_offsets(
     let mut last_pos = 0;
 
     for group in groups {
-        let (prefix_offsets, nul_pos) = group.split_at(group.len() - 1);
-        let nul_pos = nul_pos[0];
+        // Each group lists the prefix offsets followed by the NUL terminator position.
+        // `paths.json` is untrusted, so an empty group must not underflow/panic here.
+        let Some((&nul_pos, prefix_offsets)) = group.split_last() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid prefix replacement offsets: empty c-string group",
+            ));
+        };
 
         for &offset in prefix_offsets {
             // Write bytes between last position and this prefix
-            destination.write_all(&source_bytes[last_pos..offset])?;
+            write_replacement_range(&mut destination, source_bytes, last_pos, offset)?;
             // Write the new prefix
             destination.write_all(new_prefix)?;
             // Advance past old prefix in source
@@ -1042,7 +1085,7 @@ pub fn copy_and_replace_cstring_placeholder_offsets(
         }
 
         // Write remaining bytes from last prefix end to the NUL position
-        destination.write_all(&source_bytes[last_pos..nul_pos])?;
+        write_replacement_range(&mut destination, source_bytes, last_pos, nul_pos)?;
 
         // Pad with zeros to preserve total length
         let padding = prefix_offsets.len() * length_change;
@@ -1682,6 +1725,91 @@ mod test {
         assert_eq!(
             &String::from_utf8_lossy(&output.into_inner()),
             expected_output
+        );
+    }
+
+    /// Regression test: a text file that starts with a shebang line *and* contains
+    /// the prefix again in the body. The offsets recorded in `paths.json` are
+    /// *absolute* byte positions within the original file (including the occurrence
+    /// inside the shebang line). The shebang line is rewritten separately, so the
+    /// offset loop must apply the remaining offsets against the original byte
+    /// positions rather than a shebang-stripped view.
+    #[test]
+    fn test_textual_offsets_with_shebang() {
+        let prefix_placeholder = "/this/is/placeholder";
+        let target_prefix = "/opt/conda";
+        let input =
+            format!("#!{prefix_placeholder}/python\nimport sys  # see {prefix_placeholder}/lib\n")
+                .into_bytes();
+
+        // Absolute offsets, exactly as they are recorded in paths.json.
+        let offsets: Vec<usize> =
+            memchr::memmem::find_iter(&input, prefix_placeholder.as_bytes()).collect();
+        assert_eq!(
+            offsets.len(),
+            2,
+            "expected an occurrence in both the shebang and the body"
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        super::copy_and_replace_textual_placeholder_offsets(
+            &input,
+            &mut output,
+            prefix_placeholder,
+            target_prefix,
+            &Platform::Linux64,
+            &offsets,
+        )
+        .unwrap();
+
+        let expected = format!("#!{target_prefix}/python\nimport sys  # see {target_prefix}/lib\n");
+        assert_eq!(String::from_utf8_lossy(&output.into_inner()), expected);
+    }
+
+    /// Offsets come from the (untrusted) `paths.json`. Malformed offsets must return a recoverable
+    /// error rather than panic and take down the caller (e.g. a FUSE/NFS read thread).
+    #[rstest]
+    // Offset past the end of the file.
+    #[case(vec![1000])]
+    // Offsets out of order (second starts before the first prefix ends).
+    #[case(vec![7, 0])]
+    fn test_textual_offsets_invalid_returns_error(#[case] offsets: Vec<usize>) {
+        let mut output = Cursor::new(Vec::new());
+        let result = super::copy_and_replace_textual_placeholder_offsets(
+            b"Hello, cruel world!",
+            &mut output,
+            "cruel",
+            "fabulous",
+            &Platform::Linux64,
+            &offsets,
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "malformed offsets should surface as an error, not a panic"
+        );
+    }
+
+    /// Malformed binary offset groups must also return an error rather than panic (empty group,
+    /// out-of-range NUL position, ...).
+    #[rstest]
+    // Empty group would underflow `group.len() - 1`.
+    #[case(vec![vec![]])]
+    // Prefix offset and NUL position beyond the end of the file.
+    #[case(vec![vec![1000, 2000]])]
+    fn test_binary_offsets_invalid_returns_error(#[case] groups: Vec<Vec<usize>>) {
+        let mut output = Cursor::new(Vec::new());
+        let result = super::copy_and_replace_cstring_placeholder_offsets(
+            b"12345Hello, fabulous world!\x006789",
+            &mut output,
+            "fabulous",
+            "cruel",
+            &groups,
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "malformed offsets should surface as an error, not a panic"
         );
     }
 
