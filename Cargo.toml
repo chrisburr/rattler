@@ -80,6 +80,7 @@ fs-err = { version = "3.1.0" }
 fslock = "0.2.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
+fuser = { version = "0.17.0", default-features = false }
 # lots of other crates are still stuck on older version which breaks `deserialize`
 # pinning to 0.14.7 because 0.14.8 introduces deprecation notices.
 generic-array = "=0.14.7"
@@ -111,6 +112,7 @@ libc = { version = "0.2" }
 libloading = "0.9.0"
 libz-sys = { version = "1.1.22", default-features = false }
 md-5 = "0.11.0"
+mem = "0.5.0"
 memchr = "2.7.4"
 memmap2 = "0.9.5"
 miette = "7.6.0"
@@ -231,6 +233,7 @@ rattler_sandbox = { path = "crates/rattler_sandbox", version = "=0.2.23", defaul
 rattler_shell = { path = "crates/rattler_shell", version = "=0.27.8", default-features = false }
 rattler_solve = { path = "crates/rattler_solve", version = "=7.2.0", default-features = false }
 rattler_upload = { path = "crates/rattler_upload", version = "=0.8.2", default-features = false }
+rattler_vfs = { path = "crates/rattler_vfs", version = "=0.1.0", default-features = false }
 rattler_virtual_packages = { path = "crates/rattler_virtual_packages", version = "=3.0.2", default-features = false }
 
 # This is also a rattler crate, but we only pin it to minor version
