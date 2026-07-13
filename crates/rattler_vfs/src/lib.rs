@@ -968,7 +968,10 @@ fn mount_fuse(vfs: VirtualFS, config: &MountConfig) -> anyhow::Result<fuser::Bac
     let mut fuser_config = FuserConfig::default();
     fuser_config.mount_options = vec![
         MountOption::FSName("conda-packages".to_string()),
-        MountOption::CUSTOM("noatime".to_string()),
+        // Must be the typed variant: CUSTOM("noatime") ends up in the kernel
+        // data string, which fuse rejects with EINVAL when mounting directly
+        // as root (the unprivileged fusermount3 path parses it instead).
+        MountOption::NoAtime,
     ];
     if matches!(config.mode, Mode::ReadOnly | Mode::ReadOnlyIfSupported) {
         fuser_config.mount_options.push(MountOption::RO);
