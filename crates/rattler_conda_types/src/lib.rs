@@ -14,12 +14,12 @@ pub mod match_spec;
 pub mod menuinst;
 mod no_arch_type;
 mod parse_mode;
-pub mod platform;
 #[cfg(feature = "proptest")]
 pub mod proptest;
 mod repo_data;
 mod repo_data_record;
 mod run_export;
+pub mod subdir;
 pub mod utils;
 pub mod version_spec;
 
@@ -63,7 +63,6 @@ pub use package_name::{
     InvalidPackageNameError, NormalizedPackageName, PackageName, SourcePackageName,
 };
 pub use parse_mode::{ParseMatchSpecOptions, ParseStrictnessWithNameMatcher};
-pub use platform::{Arch, ParseArchError, ParsePlatformError, Platform};
 pub use prefix_data::PrefixData;
 pub use prefix_record::PrefixRecord;
 #[cfg(feature = "semver")]
@@ -79,15 +78,17 @@ pub use rattler_conda_version::version_spec::{
 pub use rattler_conda_version::{ParseStrictness, Version, VersionSpec};
 pub use record_traits::HasArtifactIdentificationRefs;
 pub use repo_data::{
-    ChannelInfo, ChannelRelations, ConvertSubdirError, PackageRecord, RecordFromPath, RepoData,
-    RepodataRevision, RepodataRevisionInfo, RepodataRevisionMetadata, RepodataRevisionSelection,
-    RepodataRevisions, ReservedV3ExtensionError, SubdirRunExportsJson, UrlOrPath, V3Extensions,
-    V3Packages, ValidatePackageRecordsError, WhlPackageRecord, compute_package_url,
+    ChannelInfo, ChannelRelations, ConvertSubdirError, MAX_REPODATA_REVISION_MESSAGE_BYTES,
+    PackageRecord, RecordFromPath, RepoData, RepodataRevision, RepodataRevisionInfo,
+    RepodataRevisionMetadata, RepodataRevisionSelection, RepodataRevisions,
+    ReservedV3ExtensionError, SubdirRunExportsJson, UrlOrPath, V3Extensions, V3Packages,
+    ValidatePackageRecordsError, WhlPackageRecord, compute_package_url,
     patches::{PackageRecordPatch, PatchInstructions, RepoDataPatch},
     sharded::{Shard, ShardedRepodata, ShardedSubdirInfo},
 };
 pub use repo_data_record::{RepoDataRecord, SolverResult};
 pub use run_export::RunExportKind;
+pub use subdir::{Arch, ParseArchError, ParseSubdirError, Subdir};
 
 /// An package identifier that can be used to identify packages across package
 /// ecosystems.

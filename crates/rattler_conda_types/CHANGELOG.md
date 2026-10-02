@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.55.0](https://github.com/conda/rattler/compare/rattler_conda_types-v0.54.0...rattler_conda_types-v0.55.0) - 2026-09-29
+
+### Added
+
+- *(sigstore)* add FulcioCiClaims from `1.3.6.1.4.1.57264.1` ([#2844](https://github.com/conda/rattler/pull/2844))
+
+### Other
+
+- [**breaking**] rename Platform to Subdir and validate names against CEP 26 ([#2787](https://github.com/conda/rattler/pull/2787))
+
+## [0.54.0](https://github.com/conda/rattler/compare/rattler_conda_types-v0.53.0...rattler_conda_types-v0.54.0) - 2026-09-23
+
+### Added
+
+- add standalone Sigstore attestation verification ([#2794](https://github.com/conda/rattler/pull/2794))
+- Add attestations to PackageRecord and rattler-index/upload ([#2773](https://github.com/conda/rattler/pull/2773))
+
 ## [0.53.0](https://github.com/conda/rattler/compare/rattler_conda_types-v0.52.1...rattler_conda_types-v0.53.0) - 2026-09-17
 
 ### Added

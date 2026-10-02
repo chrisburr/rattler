@@ -6,11 +6,13 @@ use clap::ValueEnum;
 use miette::IntoDiagnostic;
 use rattler_conda_types::{
     Channel, ChannelConfig, GenericVirtualPackage, MatchSpec, Matches, PackageName,
-    ParseMatchSpecOptions, Platform, RepoDataRecord, SolverResult, Version,
+    ParseMatchSpecOptions, RepoDataRecord, SolverResult, Subdir, Version,
 };
+use rattler_config::{ConfigBase, NoExtension};
 use rattler_solve::{IntoRepoData, SolveError, SolverImpl, SolverTask, libsolv_c, resolvo};
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 
+use crate::commands::gateway::resolve_channels;
 use crate::exclude_newer::{ExcludeNewer, NamedCutoff};
 
 /// Options that configure how an environment is solved.
@@ -36,7 +38,7 @@ pub struct SolverArgs {
 
     /// The platform to solve for. Defaults to the platform of the current host.
     #[clap(long)]
-    platform: Option<Platform>,
+    platform: Option<Subdir>,
 
     /// Virtual packages to use for solving, e.g. __glibc=2.28.
     ///
@@ -96,6 +98,10 @@ pub struct SolverArgs {
         requires = "exclude_newer"
     )]
     package_cutoffs: Vec<NamedCutoff>,
+
+    /// Policy for selecting package timestamps when using `--exclude-newer`.
+    #[clap(long, default_value = "require-timestamp")]
+    timestamp_policy: TimestampPolicy,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -117,6 +123,31 @@ impl From<SolveStrategy> for rattler_solve::SolveStrategy {
             SolveStrategy::Highest => rattler_solve::SolveStrategy::Highest,
             SolveStrategy::Lowest => rattler_solve::SolveStrategy::LowestVersion,
             SolveStrategy::LowestDirect => rattler_solve::SolveStrategy::LowestVersionDirect,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, ValueEnum)]
+pub enum TimestampPolicy {
+    /// Prefer the indexed timestamp, then the build timestamp, and allow
+    /// packages that have neither.
+    AllowMissing,
+
+    /// Prefer the indexed timestamp, then the build timestamp, and reject
+    /// packages that have neither.
+    #[default]
+    RequireTimestamp,
+
+    /// Use only the indexed timestamp and reject packages without one.
+    RequireIndexedTimestamp,
+}
+
+impl From<TimestampPolicy> for rattler_solve::TimestampPolicy {
+    fn from(value: TimestampPolicy) -> Self {
+        match value {
+            TimestampPolicy::AllowMissing => Self::AllowMissing,
+            TimestampPolicy::RequireTimestamp => Self::RequireTimestamp,
+            TimestampPolicy::RequireIndexedTimestamp => Self::RequireIndexedTimestamp,
         }
     }
 }
@@ -172,20 +203,18 @@ impl SolverArgs {
         Self::parse_specs(&self.constraints)
     }
 
-    /// The channels to solve from, defaulting to `conda-forge`.
-    pub fn channels(&self, channel_config: &ChannelConfig) -> miette::Result<Vec<Channel>> {
-        self.channels
-            .clone()
-            .unwrap_or_else(|| vec![String::from("conda-forge")])
-            .into_iter()
-            .map(|channel_str| Channel::from_str(channel_str, channel_config))
-            .collect::<Result<Vec<_>, _>>()
-            .into_diagnostic()
+    /// The channels to solve from, see [`resolve_channels`].
+    pub fn channels(
+        &self,
+        config: &ConfigBase<NoExtension>,
+        channel_config: &ChannelConfig,
+    ) -> miette::Result<Vec<Channel>> {
+        resolve_channels(self.channels.as_deref(), config, channel_config)
     }
 
     /// The platform to solve for, either as given on the command line or the
     /// platform of the current host.
-    pub fn platform(&self) -> miette::Result<Platform> {
+    pub fn platform(&self) -> miette::Result<Subdir> {
         self.platform.map_or_else(crate::host_platform, Ok)
     }
 
@@ -269,7 +298,9 @@ impl SolverArgs {
                 .apply_to_package(exclude_newer, package, now);
         }
 
-        Ok(Some(exclude_newer))
+        Ok(Some(
+            exclude_newer.with_timestamp_policy(self.timestamp_policy.into()),
+        ))
     }
 
     /// Solves the task with the selected backend.
